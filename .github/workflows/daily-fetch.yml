@@ -3,7 +3,12 @@ name: Daily Fetch
 on:
   schedule:
     - cron: '0 9 * * *'  # 每天 UTC 08:00 執行，即台灣時間下午 4 點
-  workflow_dispatch:      # 也可以在 GitHub 網頁上手動點擊執行，方便測試
+  workflow_dispatch:
+    inputs:
+      date:
+        description: '要補抓的日期 (格式 yyyyMMdd)，留空則抓今天'
+        required: false
+        default: ''
 
 jobs:
   fetch:
@@ -24,4 +29,9 @@ jobs:
 
       - name: Run fetcher
         working-directory: src/PPI.Stock.Fetcher
-        run: dotnet run
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            dotnet run -- ${{ github.event.inputs.date }}
+          else
+            dotnet run
+          fi
