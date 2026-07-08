@@ -78,6 +78,85 @@ public class GoogleSheetsClient
     }
 
     /// <summary>
+    /// 統計每個股票代號目前在資料分頁裡最早的日期，用來判斷哪些股票還沒有回補過歷史資料
+    /// (例如剛加入 Watchlist 的新股票)。沒有資料的代號不會出現在回傳的字典裡。
+    /// </summary>
+    public async Task<Dictionary<string, DateOnly>> GetEarliestDateByCodeAsync()
+    {
+        var range = $"{QuoteSheetName(_settings.DataSheetName)}!{_settings.DataRange}";
+        var getRequest = _service.Spreadsheets.Values.Get(_settings.DataSpreadsheetId, range);
+        getRequest.ValueRenderOption = SpreadsheetsResource.ValuesResource.GetRequest.ValueRenderOptionEnum.UNFORMATTEDVALUE;
+        var existing = await getRequest.ExecuteAsync();
+
+        var earliestByCode = new Dictionary<string, DateOnly>();
+        if (existing.Values == null)
+        {
+            return earliestByCode;
+        }
+
+        for (var i = 1; i < existing.Values.Count; i++)
+        {
+            var row = existing.Values[i];
+            if (row.Count < 3)
+            {
+                continue;
+            }
+
+            var dateStr = NormalizeDate(row[0]);
+            var code = row[2]?.ToString()?.Trim() ?? "";
+            if (dateStr == null || string.IsNullOrEmpty(code) || !DateOnly.TryParse(dateStr, out var date))
+            {
+                continue;
+            }
+
+            if (!earliestByCode.TryGetValue(code, out var existingEarliest) || date < existingEarliest)
+            {
+                earliestByCode[code] = date;
+            }
+        }
+
+        return earliestByCode;
+    }
+
+    /// <summary>
+    /// 讀出資料分頁裡每一列的原始內容跟它在 Sheet 上實際的列號(1-based)，
+    /// 用於診斷/清理重複資料等維護用途。
+    /// </summary>
+    public async Task<List<(int SheetRow, string Date, string Code, IList<object> Values)>> GetAllRowsWithSheetRowAsync()
+    {
+        var range = $"{QuoteSheetName(_settings.DataSheetName)}!{_settings.DataRange}";
+        var getRequest = _service.Spreadsheets.Values.Get(_settings.DataSpreadsheetId, range);
+        getRequest.ValueRenderOption = SpreadsheetsResource.ValuesResource.GetRequest.ValueRenderOptionEnum.UNFORMATTEDVALUE;
+        var existing = await getRequest.ExecuteAsync();
+
+        var result = new List<(int SheetRow, string Date, string Code, IList<object> Values)>();
+        if (existing.Values == null)
+        {
+            return result;
+        }
+
+        for (var i = 1; i < existing.Values.Count; i++)
+        {
+            var row = existing.Values[i];
+            if (row.Count < 3)
+            {
+                continue;
+            }
+
+            var dateStr = NormalizeDate(row[0]);
+            var code = row[2]?.ToString()?.Trim() ?? "";
+            if (dateStr == null || string.IsNullOrEmpty(code))
+            {
+                continue;
+            }
+
+            result.Add((i + 1, dateStr, code, row));
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// 依 (日期, 股票代號) 比對資料分頁裡已存在的資料：
     /// 不存在就新增、存在但內容不同就覆蓋更新、內容相同就跳過不動作。
     /// 用來支援一天抓兩次、以及回頭比對前一天資料的排程需求，避免重複寫入或誤判有變化。
@@ -112,6 +191,14 @@ public class GoogleSheetsClient
                 }
 
                 var key = (dateKey, code);
+                if (rowIndexByKey.TryGetValue(key, out var previousRow))
+                {
+                    // 正常情況下每個 (日期,代號) 只會有一列，如果偵測到超過一列，
+                    // 代表資料分頁裡已經有重複資料(例如過去程式 bug 或人工誤操作造成)。
+                    // 這裡不自動刪除，只印警告，避免自動化程式在使用者沒注意到的情況下擅自刪資料。
+                    Console.WriteLine($"警告：偵測到 {dateKey} {code} 有重複資料(第 {previousRow} 列與第 {i + 1} 列)，建議手動檢查並清理，目前先以最後一筆為準繼續處理。");
+                }
+
                 rowIndexByKey[key] = i + 1;
                 existingRowsByKey[key] = row;
             }
