@@ -78,6 +78,142 @@ public class GoogleSheetsClient
     }
 
     /// <summary>
+    /// 依 (日期, 股票代號) 比對資料分頁裡已存在的資料：
+    /// 不存在就新增、存在但內容不同就覆蓋更新、內容相同就跳過不動作。
+    /// 用來支援一天抓兩次、以及回頭比對前一天資料的排程需求，避免重複寫入或誤判有變化。
+    /// </summary>
+    public async Task<(int Added, int Updated, int Unchanged)> UpsertRowsAsync(
+        IEnumerable<(string Date, string Code, IList<object> Row)> rows)
+    {
+        var range = $"{QuoteSheetName(_settings.DataSheetName)}!{_settings.DataRange}";
+        var getRequest = _service.Spreadsheets.Values.Get(_settings.DataSpreadsheetId, range);
+        getRequest.ValueRenderOption = SpreadsheetsResource.ValuesResource.GetRequest.ValueRenderOptionEnum.UNFORMATTEDVALUE;
+        var existing = await getRequest.ExecuteAsync();
+
+        var rowIndexByKey = new Dictionary<(string Date, string Code), int>();
+        var existingRowsByKey = new Dictionary<(string Date, string Code), IList<object>>();
+
+        if (existing.Values != null)
+        {
+            // index 0 是表頭列，跳過；i 是 0-based 索引，對應到 Sheet 的第 (i + 1) 列(1-based)。
+            for (var i = 1; i < existing.Values.Count; i++)
+            {
+                var row = existing.Values[i];
+                if (row.Count < 3)
+                {
+                    continue;
+                }
+
+                var dateKey = NormalizeDate(row[0]);
+                var code = row[2]?.ToString()?.Trim() ?? "";
+                if (dateKey == null || string.IsNullOrEmpty(code))
+                {
+                    continue;
+                }
+
+                var key = (dateKey, code);
+                rowIndexByKey[key] = i + 1;
+                existingRowsByKey[key] = row;
+            }
+        }
+
+        var toAppend = new List<IList<object>>();
+        var updateData = new List<ValueRange>();
+        var added = 0;
+        var updated = 0;
+        var unchanged = 0;
+
+        foreach (var (date, code, row) in rows)
+        {
+            var key = (date, code);
+            if (rowIndexByKey.TryGetValue(key, out var sheetRow))
+            {
+                if (RowsEqual(existingRowsByKey[key], row))
+                {
+                    unchanged++;
+                    continue;
+                }
+
+                var updateRange = $"{QuoteSheetName(_settings.DataSheetName)}!A{sheetRow}:Z{sheetRow}";
+                updateData.Add(new ValueRange { Range = updateRange, Values = new List<IList<object>> { row } });
+                updated++;
+            }
+            else
+            {
+                toAppend.Add(row);
+                added++;
+            }
+        }
+
+        if (updateData.Count > 0)
+        {
+            var batchBody = new BatchUpdateValuesRequest
+            {
+                ValueInputOption = "USER_ENTERED",
+                Data = updateData,
+            };
+            await _service.Spreadsheets.Values.BatchUpdate(batchBody, _settings.DataSpreadsheetId).ExecuteAsync();
+        }
+
+        if (toAppend.Count > 0)
+        {
+            await AppendRowsAsync(toAppend);
+        }
+
+        return (added, updated, unchanged);
+    }
+
+    /// <summary>
+    /// 讀回來的日期儲存格可能是純文字("2026-07-08")，也可能被 Google Sheets 自動轉成
+    /// 內部的日期序號(UNFORMATTED_VALUE 模式下實測會是 Int64，理論上也可能是 double)，
+    /// 這裡都要能正確轉成統一格式比對，不然日期比對永遠對不上，upsert 就會一直誤判成新資料。
+    /// </summary>
+    private static string? NormalizeDate(object cell) => cell switch
+    {
+        string s when DateOnly.TryParse(s, out var d) => d.ToString("yyyy-MM-dd"),
+        double d => DateOnly.FromDateTime(DateTime.FromOADate(d)).ToString("yyyy-MM-dd"),
+        long l => DateOnly.FromDateTime(DateTime.FromOADate(l)).ToString("yyyy-MM-dd"),
+        int i => DateOnly.FromDateTime(DateTime.FromOADate(i)).ToString("yyyy-MM-dd"),
+        _ => null,
+    };
+
+    /// <summary>
+    /// 把儲存格值統一轉成字串比較，數字一律轉成整數字串，避免 123 跟 123.0 被誤判成不同。
+    /// </summary>
+    private static string Canon(object? cell) => cell switch
+    {
+        null => "",
+        string s => s.Trim(),
+        double d => ((long)Math.Round(d)).ToString(),
+        _ => cell.ToString() ?? "",
+    };
+
+    /// <summary>
+    /// 第 0 欄(日期)用 NormalizeDate 比對，因為既有列可能被 Sheets 存成日期序號、
+    /// 新資料是純文字，兩種型態不同但代表同一天時 Canon 直接比字串會誤判成不同；
+    /// 其餘欄位維持用 Canon 做一般數字/文字比較。
+    /// </summary>
+    private static bool RowsEqual(IList<object> existingRow, IList<object> newRow)
+    {
+        var len = Math.Max(existingRow.Count, newRow.Count);
+        for (var i = 0; i < len; i++)
+        {
+            var existingCell = i < existingRow.Count ? existingRow[i] : null;
+            var newCell = i < newRow.Count ? newRow[i] : null;
+
+            var a = i == 0 && existingCell != null ? NormalizeDate(existingCell) ?? Canon(existingCell) : Canon(existingCell);
+            var b = i == 0 && newCell != null ? NormalizeDate(newCell) ?? Canon(newCell) : Canon(newCell);
+
+            if (a != b)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
     /// A1 表示法中，分頁名稱含空白或特殊字元時必須用單引號包住，
     /// 這裡一律加上單引號並跳脫既有的單引號，不管分頁名稱是中文、英文或帶空白都能正確組出 range。
     /// </summary>
