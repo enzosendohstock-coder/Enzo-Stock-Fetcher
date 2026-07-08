@@ -11,6 +11,12 @@ on:
         required: false
         default: ''
 
+# 同一時間只能有一個執行序在跑，避免兩次排程(或排程跟手動觸發)重疊時
+# 同時讀寫 Google Sheet 造成資料競爭。新的執行會排隊等前一個跑完，不會取消它。
+concurrency:
+  group: daily-fetch
+  cancel-in-progress: false
+
 jobs:
   fetch:
     runs-on: ubuntu-latest
