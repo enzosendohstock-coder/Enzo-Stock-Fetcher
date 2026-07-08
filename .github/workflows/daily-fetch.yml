@@ -2,7 +2,8 @@ name: Daily Fetch
 
 on:
   schedule:
-    - cron: '0 9 * * *'  # 每天 UTC 08:00 執行，即台灣時間下午 4 點
+    - cron: '30 9 * * *'   # 每天 UTC 09:30 執行，即台灣時間下午 5:30
+    - cron: '30 10 * * *'  # 每天 UTC 10:30 執行，即台灣時間下午 6:30
   workflow_dispatch:
     inputs:
       date:
