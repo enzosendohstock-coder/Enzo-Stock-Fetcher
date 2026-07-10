@@ -1,9 +1,9 @@
 name: Daily Fetch
 
+# 排程觸發改由 Cloudflare Worker 的 Cron Trigger 呼叫這裡的 workflow_dispatch 完成，
+# 不再用 GitHub 自己的 schedule(GitHub 官方文件本身載明 schedule 是 best-effort，
+# 實測觀察過延遲最長達 8 小時；workflow_dispatch 是 API 觸發，不會卡進那個佇列）。
 on:
-  schedule:
-    - cron: '30 9 * * *'   # 每天 UTC 09:30 執行，即台灣時間下午 5:30
-    - cron: '30 10 * * *'  # 每天 UTC 10:30 執行，即台灣時間下午 6:30
   workflow_dispatch:
     inputs:
       date:
@@ -11,8 +11,8 @@ on:
         required: false
         default: ''
 
-# 同一時間只能有一個執行序在跑，避免兩次排程(或排程跟手動觸發)重疊時
-# 同時讀寫 Google Sheet 造成資料競爭。新的執行會排隊等前一個跑完，不會取消它。
+# 同一時間只能有一個執行序在跑，避免排程跟手動觸發重疊時同時寫入 D1 造成資料競爭。
+# 新的執行會排隊等前一個跑完，不會取消它。
 concurrency:
   group: daily-fetch
   cancel-in-progress: false
@@ -20,6 +20,9 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
+    env:
+      WorkerApi__BaseUrl: ${{ vars.WORKER_API_BASE_URL }}
+      WorkerApi__ApiToken: ${{ secrets.FETCHER_API_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -28,11 +31,6 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '9.0.x'
-
-      - name: Write Google service account credentials
-        run: |
-          mkdir -p src/PPI.Stock.Fetcher/credentials
-          echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > src/PPI.Stock.Fetcher/credentials/service-account.json
 
       - name: Run fetcher
         working-directory: src/PPI.Stock.Fetcher
