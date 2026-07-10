@@ -6,8 +6,9 @@ using Google.Apis.Sheets.v4.Data;
 namespace PPI.Stock.Fetcher;
 
 /// <summary>
-/// 讀取 Watchlist 試算表的股票代號，並將抓到的資料寫入 InstitutionalTrades 試算表。
-/// 兩者是各自獨立的試算表(不同 SpreadsheetId)，共用同一組服務帳號憑證存取。
+/// 讀取 Watchlist 試算表的股票代號，並將抓到的資料寫入資料試算表(三大法人買賣超、融資融券借券
+/// 各自獨立一份試算表，都不同 SpreadsheetId)，共用同一組服務帳號憑證存取。
+/// 除了 GetWatchlistAsync 之外的方法都是通用的讀寫工具，呼叫端指定要操作哪一份試算表/分頁/範圍。
 /// </summary>
 public class GoogleSheetsClient
 {
@@ -63,14 +64,45 @@ public class GoogleSheetsClient
     }
 
     /// <summary>
-    /// 將資料列附加到資料分頁的最後面。
+    /// 讀取追蹤清單分頁的股票代號、簡稱、全名(A:C 三欄)，只給一次性搬遷腳本用，
+    /// 一般排程流程只需要代號，用 GetWatchlistAsync 即可。
     /// </summary>
-    public async Task AppendRowsAsync(IEnumerable<IList<object>> rows)
+    public async Task<List<(string Code, string ShortName, string FullName)>> GetWatchlistDetailsAsync()
     {
-        var range = $"{QuoteSheetName(_settings.DataSheetName)}!{_settings.DataRange}";
+        var range = $"{QuoteSheetName(_settings.WatchlistSheetName)}!A2:C";
+        var request = _service.Spreadsheets.Values.Get(_settings.WatchlistSpreadsheetId, range);
+        var response = await request.ExecuteAsync();
+
+        var result = new List<(string, string, string)>();
+        if (response.Values == null)
+        {
+            return result;
+        }
+
+        foreach (var row in response.Values)
+        {
+            var code = row.Count > 0 ? row[0]?.ToString()?.Trim() ?? "" : "";
+            if (string.IsNullOrEmpty(code))
+            {
+                continue;
+            }
+            var shortName = row.Count > 1 ? row[1]?.ToString()?.Trim() ?? "" : "";
+            var fullName = row.Count > 2 ? row[2]?.ToString()?.Trim() ?? "" : "";
+            result.Add((code, shortName, fullName));
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 將資料列附加到指定資料分頁的最後面。
+    /// </summary>
+    public async Task AppendRowsAsync(string spreadsheetId, string sheetName, string dataRange, IEnumerable<IList<object>> rows)
+    {
+        var range = $"{QuoteSheetName(sheetName)}!{dataRange}";
         var body = new ValueRange { Values = rows.ToList() };
 
-        var request = _service.Spreadsheets.Values.Append(body, _settings.DataSpreadsheetId, range);
+        var request = _service.Spreadsheets.Values.Append(body, spreadsheetId, range);
         request.ValueInputOption = SpreadsheetsResource.ValuesResource.AppendRequest.ValueInputOptionEnum.USERENTERED;
         request.InsertDataOption = SpreadsheetsResource.ValuesResource.AppendRequest.InsertDataOptionEnum.INSERTROWS;
 
@@ -78,13 +110,13 @@ public class GoogleSheetsClient
     }
 
     /// <summary>
-    /// 統計每個股票代號目前在資料分頁裡最早的日期，用來判斷哪些股票還沒有回補過歷史資料
+    /// 統計每個股票代號目前在指定資料分頁裡最早的日期，用來判斷哪些股票還沒有回補過歷史資料
     /// (例如剛加入 Watchlist 的新股票)。沒有資料的代號不會出現在回傳的字典裡。
     /// </summary>
-    public async Task<Dictionary<string, DateOnly>> GetEarliestDateByCodeAsync()
+    public async Task<Dictionary<string, DateOnly>> GetEarliestDateByCodeAsync(string spreadsheetId, string sheetName, string dataRange)
     {
-        var range = $"{QuoteSheetName(_settings.DataSheetName)}!{_settings.DataRange}";
-        var getRequest = _service.Spreadsheets.Values.Get(_settings.DataSpreadsheetId, range);
+        var range = $"{QuoteSheetName(sheetName)}!{dataRange}";
+        var getRequest = _service.Spreadsheets.Values.Get(spreadsheetId, range);
         getRequest.ValueRenderOption = SpreadsheetsResource.ValuesResource.GetRequest.ValueRenderOptionEnum.UNFORMATTEDVALUE;
         var existing = await getRequest.ExecuteAsync();
 
@@ -119,13 +151,13 @@ public class GoogleSheetsClient
     }
 
     /// <summary>
-    /// 讀出資料分頁裡每一列的原始內容跟它在 Sheet 上實際的列號(1-based)，
+    /// 讀出指定資料分頁裡每一列的原始內容跟它在 Sheet 上實際的列號(1-based)，
     /// 用於診斷/清理重複資料等維護用途。
     /// </summary>
-    public async Task<List<(int SheetRow, string Date, string Code, IList<object> Values)>> GetAllRowsWithSheetRowAsync()
+    public async Task<List<(int SheetRow, string Date, string Code, IList<object> Values)>> GetAllRowsWithSheetRowAsync(string spreadsheetId, string sheetName, string dataRange)
     {
-        var range = $"{QuoteSheetName(_settings.DataSheetName)}!{_settings.DataRange}";
-        var getRequest = _service.Spreadsheets.Values.Get(_settings.DataSpreadsheetId, range);
+        var range = $"{QuoteSheetName(sheetName)}!{dataRange}";
+        var getRequest = _service.Spreadsheets.Values.Get(spreadsheetId, range);
         getRequest.ValueRenderOption = SpreadsheetsResource.ValuesResource.GetRequest.ValueRenderOptionEnum.UNFORMATTEDVALUE;
         var existing = await getRequest.ExecuteAsync();
 
@@ -157,15 +189,18 @@ public class GoogleSheetsClient
     }
 
     /// <summary>
-    /// 依 (日期, 股票代號) 比對資料分頁裡已存在的資料：
+    /// 依 (日期, 股票代號) 比對指定資料分頁裡已存在的資料：
     /// 不存在就新增、存在但內容不同就覆蓋更新、內容相同就跳過不動作。
     /// 用來支援一天抓兩次、以及回頭比對前一天資料的排程需求，避免重複寫入或誤判有變化。
     /// </summary>
     public async Task<(int Added, int Updated, int Unchanged)> UpsertRowsAsync(
+        string spreadsheetId,
+        string sheetName,
+        string dataRange,
         IEnumerable<(string Date, string Code, IList<object> Row)> rows)
     {
-        var range = $"{QuoteSheetName(_settings.DataSheetName)}!{_settings.DataRange}";
-        var getRequest = _service.Spreadsheets.Values.Get(_settings.DataSpreadsheetId, range);
+        var range = $"{QuoteSheetName(sheetName)}!{dataRange}";
+        var getRequest = _service.Spreadsheets.Values.Get(spreadsheetId, range);
         getRequest.ValueRenderOption = SpreadsheetsResource.ValuesResource.GetRequest.ValueRenderOptionEnum.UNFORMATTEDVALUE;
         var existing = await getRequest.ExecuteAsync();
 
@@ -196,7 +231,7 @@ public class GoogleSheetsClient
                     // 正常情況下每個 (日期,代號) 只會有一列，如果偵測到超過一列，
                     // 代表資料分頁裡已經有重複資料(例如過去程式 bug 或人工誤操作造成)。
                     // 這裡不自動刪除，只印警告，避免自動化程式在使用者沒注意到的情況下擅自刪資料。
-                    Console.WriteLine($"警告：偵測到 {dateKey} {code} 有重複資料(第 {previousRow} 列與第 {i + 1} 列)，建議手動檢查並清理，目前先以最後一筆為準繼續處理。");
+                    Console.WriteLine($"警告：偵測到 {sheetName} 分頁 {dateKey} {code} 有重複資料(第 {previousRow} 列與第 {i + 1} 列)，建議手動檢查並清理，目前先以最後一筆為準繼續處理。");
                 }
 
                 rowIndexByKey[key] = i + 1;
@@ -221,7 +256,8 @@ public class GoogleSheetsClient
                     continue;
                 }
 
-                var updateRange = $"{QuoteSheetName(_settings.DataSheetName)}!A{sheetRow}:Z{sheetRow}";
+                var lastColumn = ColumnLetterFromRange(dataRange);
+                var updateRange = $"{QuoteSheetName(sheetName)}!A{sheetRow}:{lastColumn}{sheetRow}";
                 updateData.Add(new ValueRange { Range = updateRange, Values = new List<IList<object>> { row } });
                 updated++;
             }
@@ -239,15 +275,24 @@ public class GoogleSheetsClient
                 ValueInputOption = "USER_ENTERED",
                 Data = updateData,
             };
-            await _service.Spreadsheets.Values.BatchUpdate(batchBody, _settings.DataSpreadsheetId).ExecuteAsync();
+            await _service.Spreadsheets.Values.BatchUpdate(batchBody, spreadsheetId).ExecuteAsync();
         }
 
         if (toAppend.Count > 0)
         {
-            await AppendRowsAsync(toAppend);
+            await AppendRowsAsync(spreadsheetId, sheetName, dataRange, toAppend);
         }
 
         return (added, updated, unchanged);
+    }
+
+    /// <summary>
+    /// 從像 "A:Z"、"A:W" 這種範圍字串取出結尾的欄位字母，組更新單一列時的範圍要用。
+    /// </summary>
+    private static string ColumnLetterFromRange(string dataRange)
+    {
+        var parts = dataRange.Split(':');
+        return parts.Length == 2 ? parts[1] : "Z";
     }
 
     /// <summary>

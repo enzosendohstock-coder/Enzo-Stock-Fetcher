@@ -13,4 +13,9 @@ public class GoogleSheetsSettings
     public string DataSpreadsheetId { get; set; } = "";
     public string DataSheetName { get; set; } = "InstitutionalTrades";
     public string DataRange { get; set; } = "A:Z";
+
+    // MarginTrading 是融資融券+借券餘額這個主題專屬的資料，另外獨立一份試算表。
+    public string MarginDataSpreadsheetId { get; set; } = "";
+    public string MarginDataSheetName { get; set; } = "MarginTrading";
+    public string MarginDataRange { get; set; } = "A:W";
 }
