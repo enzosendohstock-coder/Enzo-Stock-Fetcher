@@ -108,9 +108,15 @@ foreach (var targetDate in datesToProcess)
 {
     // TWSE 偶爾會回傳格式異常的回應(例如缺欄位)，單一天出錯不該讓整個回補批次中斷，
     // 印警告、跳過這一天、繼續處理下一天即可，之後可以針對這天單獨重跑。
+    // 但如果是被 TWSE 暫時封鎖(307 導向)，代表繼續送更多請求也沒用，整批直接中止。
     try
     {
         await ProcessInstitutionalDateAsync(targetDate, watchlist, api, twse, tpex);
+    }
+    catch (Exception ex) when (IsTwseBlocked(ex))
+    {
+        Console.WriteLine("警告：TWSE 疑似暫時封鎖本次執行的來源(收到 307 導向)，立即停止本次執行，留到下次排程接著跑。");
+        return;
     }
     catch (Exception ex)
     {
@@ -120,6 +126,11 @@ foreach (var targetDate in datesToProcess)
     try
     {
         await ProcessMarginDateAsync(targetDate, watchlist, api, twseMargin, tpexMargin);
+    }
+    catch (Exception ex) when (IsTwseBlocked(ex))
+    {
+        Console.WriteLine("警告：TWSE 疑似暫時封鎖本次執行的來源(收到 307 導向)，立即停止本次執行，留到下次排程接著跑。");
+        return;
     }
     catch (Exception ex)
     {
@@ -328,12 +339,21 @@ static async Task BackfillNewStocksAsync(
 
     Console.WriteLine($"偵測到 {stocksNeedingAny.Count} 檔股票缺少從 {historyStartDate:yyyy-MM-dd} 開始的歷史資料，自動回補中：{string.Join(", ", stocksNeedingAny)}");
 
+    // 刻意從「昨天」往回補到歷史起始日，而不是從起始日往前補：這樣萬一這次執行被 TWSE 中斷，
+    // 已經補到的都是「比較新」的日期，GetEarliestDateByCodeAsync 抓到的最早日期依然會比門檻晚，
+    // 下次排程會自然判斷「還沒補完」並從昨天重新往回接著補，不會卡在同一個地方一直重來。
     var yesterday = DateOnly.FromDateTime(DateTime.Today).AddDays(-1);
     var backfillDates = new List<DateOnly>();
-    for (var d = historyStartDate; d <= yesterday; d = d.AddDays(1))
+    for (var d = yesterday; d >= historyStartDate; d = d.AddDays(-1))
     {
         backfillDates.Add(d);
     }
+
+    // 回補是一次要打上百次 TWSE/TPEx 請求，比平常的 5 天滾動視窗密集很多，
+    // 曾經實測觸發過 TWSE 的防濫用機制(回傳 307 導向到封鎖頁面)。
+    // 間隔拉長一點降低觸發機會；一旦真的偵測到封鎖，整批回補立刻中止，
+    // 不要繼續對已經封鎖自己的來源送更多請求，留到下次排程再繼續。
+    const int backfillDelayMs = 1000;
 
     foreach (var code in stocksNeedingAny)
     {
@@ -341,7 +361,7 @@ static async Task BackfillNewStocksAsync(
         var doMargin = needsMargin.Contains(code);
         var singleStockWatchlist = new List<string> { code };
 
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 開始自動回補股票代號 {code}(三大法人：{(doInstitutional ? "是" : "否")}，融資融券：{(doMargin ? "是" : "否")})，範圍 {historyStartDate:yyyy-MM-dd} ~ {yesterday:yyyy-MM-dd}...");
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 開始自動回補股票代號 {code}(三大法人：{(doInstitutional ? "是" : "否")}，融資融券：{(doMargin ? "是" : "否")})，範圍 {yesterday:yyyy-MM-dd} 往回補到 {historyStartDate:yyyy-MM-dd}...");
 
         foreach (var targetDate in backfillDates)
         {
@@ -350,6 +370,11 @@ static async Task BackfillNewStocksAsync(
                 try
                 {
                     await ProcessInstitutionalDateAsync(targetDate, singleStockWatchlist, api, twse, tpex);
+                }
+                catch (Exception ex) when (IsTwseBlocked(ex))
+                {
+                    Console.WriteLine($"警告：TWSE 疑似暫時封鎖本次執行的來源(收到 307 導向)，立即停止本次歷史回補，留到下次排程接著補。");
+                    return;
                 }
                 catch (Exception ex)
                 {
@@ -363,18 +388,28 @@ static async Task BackfillNewStocksAsync(
                 {
                     await ProcessMarginDateAsync(targetDate, singleStockWatchlist, api, twseMargin, tpexMargin);
                 }
+                catch (Exception ex) when (IsTwseBlocked(ex))
+                {
+                    Console.WriteLine($"警告：TWSE 疑似暫時封鎖本次執行的來源(收到 307 導向)，立即停止本次歷史回補，留到下次排程接著補。");
+                    return;
+                }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"警告：{targetDate:yyyy-MM-dd} 融資融券處理失敗，跳過並繼續下一天。錯誤：{ex.Message}");
                 }
             }
 
-            await Task.Delay(300);
+            await Task.Delay(backfillDelayMs);
         }
 
         Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 股票代號 {code} 的歷史回補完成。");
     }
 }
+
+// TWSE 對短時間內大量請求的來源會回傳 307 導向到封鎖頁面(而非單純的錯誤狀態碼)，
+// 這是判斷「已經被暫時封鎖」的訊號，跟其他偶發性的格式錯誤要分開處理。
+static bool IsTwseBlocked(Exception ex) =>
+    ex is HttpRequestException httpEx && httpEx.StatusCode == System.Net.HttpStatusCode.TemporaryRedirect;
 
 static DateOnly[] ParseDateArg(string arg)
 {
