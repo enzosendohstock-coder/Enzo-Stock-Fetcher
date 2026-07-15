@@ -3,20 +3,29 @@ using System.Text.Json;
 namespace PPI.Stock.Fetcher;
 
 /// <summary>
-/// 呼叫證券櫃檯買賣中心(TPEx)公開的三大法人買賣明細 OpenAPI，僅涵蓋上櫃股票。
-/// 注意：此 API 只提供「最新一個交易日」的資料，不支援指定歷史日期查詢，因此不能用來回補過去的資料。
-/// 官方文件的 JSON 欄位名稱有不一致的空白字元(例如欄位前後多了空格)，
-/// 這裡一律先去除所有欄位名稱中的空白字元再比對，避免因為官方資料的小瑕疵而解析失敗。
+/// 呼叫證券櫃檯買賣中心(TPEx)「三大法人買賣明細資訊」網頁背後的資料 API，涵蓋上櫃股票。
+/// 支援指定任意歷史日期查詢(西元年，月/日需補零，例如 2026/01/08)。
+///
+/// 這個端點是 2026-07 從 https://www.tpex.org.tw/zh-tw/mainboard/trading/major-institutional/detail/day.html
+/// 這個網頁實際使用的 API 逆向出來的，跟舊版 tpex_3insti_daily_trading OpenAPI（只能抓最新一天）不同：
+/// - 舊版 OpenAPI：GET /openapi/v1/tpex_3insti_daily_trading，不支援日期參數，永遠回傳最新一個交易日。
+/// - 這個新端點：POST /www/zh-tw/insti/dailyTrade，body 帶 date 參數即可查任意歷史日期。
+///
+/// 欄位對應(共 24 欄，索引0起)已用同一天的舊版 OpenAPI 資料逐欄比對數字驗證過，關係如下：
+///   0:代號 1:名稱
+///   2-4:  外陸資(不含外資自營商) 買/賣/淨
+///   5-7:  外資自營商 買/賣/淨
+///   8-10: 外資合計 買/賣/淨（= 2-4 + 5-7）
+///   11-13:投信 買/賣/淨
+///   14-16:自營商-自行買賣 買/賣/淨（舊版 OpenAPI 沒有這個細分）
+///   17-19:自營商-避險 買/賣/淨（舊版 OpenAPI 沒有這個細分）
+///   20-22:自營商合計 買/賣/淨（= 14-16 + 17-19，對應舊版 OpenAPI 的 Dealers-*）
+///   23:   三大法人合計買賣超(淨額)
 /// </summary>
 public class TpexClient
 {
-    private const string Url = "https://www.tpex.org.tw/openapi/v1/tpex_3insti_daily_trading";
-
-    private const string ForeignExDealerBase = "ForeignInvestorsincludeMainlandAreaInvestors(ForeignDealersexcluded)";
-    private const string ForeignDealerBase = "ForeignDealers";
-    private const string ForeignTotalBase = "ForeignInvestorsIncludeMainlandAreaInvestors";
-    private const string TrustBase = "SecuritiesInvestmentTrustCompanies";
-    private const string DealerTotalBase = "Dealers";
+    private const string Url = "https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade";
+    private const string RefererUrl = "https://www.tpex.org.tw/zh-tw/mainboard/trading/major-institutional/detail/day.html";
 
     private readonly HttpClient _httpClient;
 
@@ -25,118 +34,110 @@ public class TpexClient
         _httpClient = httpClient;
     }
 
+    /// <summary>
+    /// 取得指定日期，全市場上櫃股票的三大法人買賣超明細。
+    /// 若當天非交易日(假日)，回傳空字典。
+    /// </summary>
     public async Task<Dictionary<string, InstitutionalTradeDetail>> GetInstitutionalTradesAsync(DateOnly date)
     {
-        using var response = await _httpClient.GetAsync(Url);
+        var dateParam = $"{date.Year:D4}/{date.Month:D2}/{date.Day:D2}";
+        using var content = new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["type"] = "Daily",
+            ["sect"] = "AL",
+            ["date"] = dateParam,
+            ["id"] = "",
+            ["response"] = "json",
+        });
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, Url) { Content = content };
+        request.Headers.Add("X-Requested-With", "XMLHttpRequest");
+        request.Headers.Add("Referer", RefererUrl);
+
+        using var response = await _httpClient.SendAsync(request);
         response.EnsureSuccessStatusCode();
 
         var json = await response.Content.ReadAsStringAsync();
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
 
-        if (root.ValueKind != JsonValueKind.Array || root.GetArrayLength() == 0)
+        var stat = root.TryGetProperty("stat", out var statEl) ? statEl.GetString() : null;
+        if (stat != "ok" || !root.TryGetProperty("tables", out var tablesEl) || tablesEl.GetArrayLength() == 0)
         {
             return new Dictionary<string, InstitutionalTradeDetail>();
         }
 
-        var firstRow = Normalize(root[0]);
-        var actualDate = ParseRocDate(firstRow["Date"]);
-        if (actualDate != date)
+        var table = tablesEl[0];
+        if (!table.TryGetProperty("data", out var dataEl) || dataEl.GetArrayLength() == 0)
         {
-            Console.WriteLine($"警告：TPEx 開放資料目前只有 {actualDate:yyyy-MM-dd} 的資料，無法取得 {date:yyyy-MM-dd}（TPEx OpenAPI 不支援指定歷史日期查詢，上櫃股票只能抓當天）。");
+            // 非交易日(假日)或當天尚未公布資料，官方會回傳 stat=ok 但 data 是空陣列。
             return new Dictionary<string, InstitutionalTradeDetail>();
         }
+
+        long Num(string[] cells, int idx) =>
+            idx < cells.Length && long.TryParse(cells[idx].Trim().Replace(",", ""), out var v) ? v : 0;
 
         var result = new Dictionary<string, InstitutionalTradeDetail>();
-        foreach (var rawRow in root.EnumerateArray())
+        foreach (var row in dataEl.EnumerateArray())
         {
-            var row = Normalize(rawRow);
-            var code = row["SecuritiesCompanyCode"].Trim();
+            var cells = row.EnumerateArray().Select(c => c.GetString() ?? "").ToArray();
+            if (cells.Length < 24)
+            {
+                // 偶爾會有欄位數量不足的異常列，跳過避免索引超出範圍。
+                continue;
+            }
+
+            var code = cells[0].Trim();
             if (string.IsNullOrEmpty(code))
             {
                 continue;
             }
 
-            var exDealerBuy = Num(row, $"{ForeignExDealerBase}-TotalBuy");
-            var exDealerSell = Num(row, $"{ForeignExDealerBase}-TotalSell");
-            var exDealerNet = Num(row, $"{ForeignExDealerBase}-Difference");
-
-            var foreignDealerBuy = Num(row, $"{ForeignDealerBase}-TotalBuy");
-            var foreignDealerSell = Num(row, $"{ForeignDealerBase}-TotalSell");
-            var foreignDealerNet = Num(row, $"{ForeignDealerBase}-Difference");
+            var dealerSelfBuy = Num(cells, 14);
+            var dealerSelfSell = Num(cells, 15);
+            var dealerSelfNet = Num(cells, 16);
+            var dealerHedgeBuy = Num(cells, 17);
+            var dealerHedgeSell = Num(cells, 18);
+            var dealerHedgeNet = Num(cells, 19);
 
             result[code] = new InstitutionalTradeDetail
             {
                 StockCode = code,
-                StockName = row["CompanyName"].Trim(),
+                StockName = cells[1].Trim(),
                 Market = Market.Otc,
 
-                ForeignExDealerBuy = exDealerBuy,
-                ForeignExDealerSell = exDealerSell,
-                ForeignExDealerNet = exDealerNet,
+                ForeignExDealerBuy = Num(cells, 2),
+                ForeignExDealerSell = Num(cells, 3),
+                ForeignExDealerNet = Num(cells, 4),
 
-                ForeignDealerBuy = foreignDealerBuy,
-                ForeignDealerSell = foreignDealerSell,
-                ForeignDealerNet = foreignDealerNet,
+                ForeignDealerBuy = Num(cells, 5),
+                ForeignDealerSell = Num(cells, 6),
+                ForeignDealerNet = Num(cells, 7),
 
-                ForeignTotalBuy = Num(row, $"{ForeignTotalBase}-TotalBuy"),
-                ForeignTotalSell = Num(row, $"{ForeignTotalBase}-TotalSell"),
-                ForeignTotalNet = Num(row, $"{ForeignTotalBase}-Difference"),
+                ForeignTotalBuy = Num(cells, 8),
+                ForeignTotalSell = Num(cells, 9),
+                ForeignTotalNet = Num(cells, 10),
 
-                TrustBuy = Num(row, $"{TrustBase}-TotalBuy"),
-                TrustSell = Num(row, $"{TrustBase}-TotalSell"),
-                TrustNet = Num(row, $"{TrustBase}-Difference"),
+                TrustBuy = Num(cells, 11),
+                TrustSell = Num(cells, 12),
+                TrustNet = Num(cells, 13),
 
-                // 上櫃股票的自營商買賣超不分「自行買賣」與「避險」，官方只給合計。
-                DealerSelfBuy = null,
-                DealerSelfSell = null,
-                DealerSelfNet = null,
-                DealerHedgeBuy = null,
-                DealerHedgeSell = null,
-                DealerHedgeNet = null,
+                DealerSelfBuy = dealerSelfBuy,
+                DealerSelfSell = dealerSelfSell,
+                DealerSelfNet = dealerSelfNet,
 
-                DealerTotalBuy = Num(row, $"{DealerTotalBase}-TotalBuy"),
-                DealerTotalSell = Num(row, $"{DealerTotalBase}-TotalSell"),
-                DealerTotalNet = Num(row, $"{DealerTotalBase}-Difference"),
+                DealerHedgeBuy = dealerHedgeBuy,
+                DealerHedgeSell = dealerHedgeSell,
+                DealerHedgeNet = dealerHedgeNet,
 
-                GrandTotalNet = Num(row, "TotalDifference"),
+                DealerTotalBuy = Num(cells, 20),
+                DealerTotalSell = Num(cells, 21),
+                DealerTotalNet = Num(cells, 22),
+
+                GrandTotalNet = Num(cells, 23),
             };
         }
 
         return result;
-    }
-
-    /// <summary>
-    /// 將 JSON 物件的欄位名稱去除所有空白字元後，轉成 Dictionary 方便查找。
-    /// </summary>
-    private static Dictionary<string, string> Normalize(JsonElement obj)
-    {
-        var dict = new Dictionary<string, string>();
-        foreach (var prop in obj.EnumerateObject())
-        {
-            var key = new string(prop.Name.Where(c => !char.IsWhiteSpace(c)).ToArray());
-            // TPEx 偶爾會把某些欄位回傳成 JSON 數字而非字串(型別不一致)，一律用原始文字讀出避免解析炸掉。
-            dict[key] = prop.Value.ValueKind switch
-            {
-                JsonValueKind.String => prop.Value.GetString() ?? "",
-                JsonValueKind.Null => "",
-                _ => prop.Value.GetRawText(),
-            };
-        }
-        return dict;
-    }
-
-    private static long Num(Dictionary<string, string> row, string key) =>
-        row.TryGetValue(key, out var raw) && long.TryParse(raw.Trim().Replace(",", ""), out var v) ? v : 0;
-
-    /// <summary>
-    /// 將民國日期字串(例如 "1150703")轉成西元日期。
-    /// </summary>
-    private static DateOnly ParseRocDate(string rocDate)
-    {
-        var month = int.Parse(rocDate.Substring(rocDate.Length - 4, 2));
-        var day = int.Parse(rocDate.Substring(rocDate.Length - 2, 2));
-        var rocYear = int.Parse(rocDate[..(rocDate.Length - 4)]);
-        return new DateOnly(rocYear + 1911, month, day);
     }
 }

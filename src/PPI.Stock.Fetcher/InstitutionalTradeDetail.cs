@@ -8,7 +8,8 @@ public enum Market
 
 /// <summary>
 /// 單一股票、單一交易日的三大法人買賣超明細。
-/// 自營商-自行買賣 / 自營商-避險 只有上市(TWSE)有提供拆分，上櫃(TPEx)只給合計，故為 nullable。
+/// 自營商-自行買賣 / 自營商-避險：上市(TWSE)、上櫃(TPEx，2026-07 起改用新端點)都有提供拆分，
+/// 保留 nullable 是為了保險起見(萬一某個資料來源哪天又不提供這個細分了)，目前兩邊都會是非 null 值。
 /// </summary>
 public class InstitutionalTradeDetail
 {
