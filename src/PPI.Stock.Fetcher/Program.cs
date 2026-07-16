@@ -98,6 +98,7 @@ var twse = new TwseClient(httpClient);
 var tpex = new TpexClient(httpClient);
 var twseMargin = new TwseMarginClient(httpClient);
 var tpexMargin = new TpexMarginClient(httpClient);
+var foreignShareholding = new ForeignShareholdingClient(httpClient);
 
 var datesToProcess = explicitDates
     ?? Enumerable.Range(0, RollingWindowDays)
@@ -137,6 +138,20 @@ foreach (var targetDate in datesToProcess)
         Console.WriteLine($"警告：{targetDate:yyyy-MM-dd} 融資融券處理失敗，跳過並繼續下一天。錯誤：{ex.Message}");
     }
 
+    try
+    {
+        await ProcessForeignShareholdingDateAsync(targetDate, watchlist, api, foreignShareholding);
+    }
+    catch (Exception ex) when (IsTwseBlocked(ex))
+    {
+        Console.WriteLine("警告：TWSE 疑似暫時封鎖本次執行的來源(收到 307 導向)，立即停止本次執行，留到下次排程接著跑。");
+        return;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"警告：{targetDate:yyyy-MM-dd} 外資持股比率處理失敗，跳過並繼續下一天。錯誤：{ex.Message}");
+    }
+
     // 區間回補會連續呼叫 API 很多次，稍微間隔一下比較不會對 TWSE/TPEx 造成負擔。
     if (datesToProcess.Length > 1)
     {
@@ -148,7 +163,7 @@ foreach (var targetDate in datesToProcess)
 // 手動指定日期/區間跑的時候維持原本行為，不觸發這個額外步驟。
 if (explicitDates == null)
 {
-    await BackfillNewStocksAsync(watchlist, api, twse, tpex, twseMargin, tpexMargin, historyStartDate);
+    await BackfillNewStocksAsync(watchlist, api, twse, tpex, twseMargin, tpexMargin, foreignShareholding, historyStartDate);
 }
 
 static async Task FindDuplicatesAsync(GoogleSheetsClient sheets, string spreadsheetId, string sheetName, string dataRange)
@@ -315,10 +330,12 @@ static async Task BackfillNewStocksAsync(
     TpexClient tpex,
     TwseMarginClient twseMargin,
     TpexMarginClient tpexMargin,
+    ForeignShareholdingClient foreignShareholding,
     DateOnly historyStartDate)
 {
     var institutionalEarliest = await api.GetEarliestDateByCodeAsync("institutional");
     var marginEarliest = await api.GetEarliestDateByCodeAsync("margin");
+    var foreignShareholdingEarliest = await api.GetEarliestDateByCodeAsync("foreignShareholding");
 
     // 緩衝 14 天，避免把「本來就從 1 月中才有資料的正常股票」誤判成新股票
     // (年初這幾天常常剛好遇到假日，資料本來就不會剛好從歷史起始日當天開始)。
@@ -326,11 +343,12 @@ static async Task BackfillNewStocksAsync(
     bool NeedsBackfill(Dictionary<string, DateOnly> earliestByCode, string code) =>
         !earliestByCode.TryGetValue(code, out var earliest) || earliest > threshold;
 
-    // 兩份資料分頁各自獨立判斷，例如剛新增「融資融券」這份分頁時，既有股票的三大法人資料
-    // 已經齊全不需要回補，但融資融券分頁是全新的，仍然需要幫既有股票補歷史資料。
+    // 三份資料表各自獨立判斷，例如剛新增「外資持股比率」這份表時，既有股票的三大法人資料
+    // 已經齊全不需要回補，但這份表是全新的，仍然需要幫既有股票補歷史資料。
     var needsInstitutional = watchlist.Where(c => NeedsBackfill(institutionalEarliest, c)).ToHashSet();
     var needsMargin = watchlist.Where(c => NeedsBackfill(marginEarliest, c)).ToHashSet();
-    var stocksNeedingAny = needsInstitutional.Union(needsMargin).ToList();
+    var needsForeignShareholding = watchlist.Where(c => NeedsBackfill(foreignShareholdingEarliest, c)).ToHashSet();
+    var stocksNeedingAny = needsInstitutional.Union(needsMargin).Union(needsForeignShareholding).ToList();
 
     if (stocksNeedingAny.Count == 0)
     {
@@ -359,9 +377,10 @@ static async Task BackfillNewStocksAsync(
     {
         var doInstitutional = needsInstitutional.Contains(code);
         var doMargin = needsMargin.Contains(code);
+        var doForeignShareholding = needsForeignShareholding.Contains(code);
         var singleStockWatchlist = new List<string> { code };
 
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 開始自動回補股票代號 {code}(三大法人：{(doInstitutional ? "是" : "否")}，融資融券：{(doMargin ? "是" : "否")})，範圍 {yesterday:yyyy-MM-dd} 往回補到 {historyStartDate:yyyy-MM-dd}...");
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 開始自動回補股票代號 {code}(三大法人：{(doInstitutional ? "是" : "否")}，融資融券：{(doMargin ? "是" : "否")}，外資持股比率：{(doForeignShareholding ? "是" : "否")})，範圍 {yesterday:yyyy-MM-dd} 往回補到 {historyStartDate:yyyy-MM-dd}...");
 
         foreach (var targetDate in backfillDates)
         {
@@ -396,6 +415,23 @@ static async Task BackfillNewStocksAsync(
                 catch (Exception ex)
                 {
                     Console.WriteLine($"警告：{targetDate:yyyy-MM-dd} 融資融券處理失敗，跳過並繼續下一天。錯誤：{ex.Message}");
+                }
+            }
+
+            if (doForeignShareholding)
+            {
+                try
+                {
+                    await ProcessForeignShareholdingDateAsync(targetDate, singleStockWatchlist, api, foreignShareholding);
+                }
+                catch (Exception ex) when (IsTwseBlocked(ex))
+                {
+                    Console.WriteLine($"警告：TWSE 疑似暫時封鎖本次執行的來源(收到 307 導向)，立即停止本次歷史回補，留到下次排程接著補。");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"警告：{targetDate:yyyy-MM-dd} 外資持股比率處理失敗，跳過並繼續下一天。錯誤：{ex.Message}");
                 }
             }
 
@@ -605,4 +641,70 @@ static async Task<(Dictionary<string, MarginTradingDetail> Listed, Dictionary<st
     }
 
     return (listedMargin, otcMargin);
+}
+
+static async Task ProcessForeignShareholdingDateAsync(
+    DateOnly targetDate,
+    List<string> watchlist,
+    WorkerApiClient api,
+    ForeignShareholdingClient foreignShareholding)
+{
+    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 開始處理 {targetDate:yyyy-MM-dd} 的外資持股比率資料...");
+
+    var shareholding = await FetchForeignShareholdingWithRetryAsync(targetDate, watchlist, foreignShareholding);
+
+    if (shareholding.Count == 0)
+    {
+        Console.WriteLine($"{targetDate:yyyy-MM-dd} 外資持股比率沒有資料，可能是假日或非交易日，跳過。");
+        return;
+    }
+
+    var details = new List<ForeignShareholdingDetail>();
+    foreach (var code in watchlist)
+    {
+        if (shareholding.TryGetValue(code, out var detail))
+        {
+            details.Add(detail);
+        }
+        else
+        {
+            Console.WriteLine($"警告：{targetDate:yyyy-MM-dd} 外資持股比率找不到股票代號 {code} 的資料，請確認代號是否正確，或該股票當天無交易。");
+        }
+    }
+
+    if (details.Count == 0)
+    {
+        Console.WriteLine($"{targetDate:yyyy-MM-dd} 外資持股比率沒有任何一檔股票有資料可寫入。");
+        return;
+    }
+
+    var (added, updated, unchanged) = await api.UpsertForeignShareholdingAsync(targetDate, details);
+    Console.WriteLine($"{targetDate:yyyy-MM-dd} 外資持股比率：新增 {added} 筆、更新 {updated} 筆、未變 {unchanged} 筆。");
+}
+
+static async Task<Dictionary<string, ForeignShareholdingDetail>> FetchForeignShareholdingWithRetryAsync(
+    DateOnly targetDate, List<string> watchlist, ForeignShareholdingClient foreignShareholding)
+{
+    var shareholding = await foreignShareholding.GetForeignShareholdingAsync(targetDate);
+
+    const int maxMissingRetries = 2;
+    for (var attempt = 0; attempt < maxMissingRetries; attempt++)
+    {
+        if (shareholding.Count == 0)
+        {
+            break; // 非交易日，不用因為缺代號而重試
+        }
+
+        var missing = watchlist.Where(c => !shareholding.ContainsKey(c)).ToList();
+        if (missing.Count == 0)
+        {
+            break;
+        }
+
+        Console.WriteLine($"警告：{targetDate:yyyy-MM-dd} 外資持股比率有 {missing.Count} 檔股票查無資料({string.Join(", ", missing)})，等待後重試...");
+        await Task.Delay(3000);
+        shareholding = await foreignShareholding.GetForeignShareholdingAsync(targetDate);
+    }
+
+    return shareholding;
 }

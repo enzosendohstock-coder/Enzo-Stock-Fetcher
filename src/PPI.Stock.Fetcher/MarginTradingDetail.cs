@@ -2,8 +2,8 @@ namespace PPI.Stock.Fetcher;
 
 /// <summary>
 /// 單一股票、單一交易日的融資融券 + 借券餘額明細。
-/// 融資融券欄位來自 TWSE MI_MARGN / TPEx tpex_mainboard_margin_balance，
-/// 借券餘額欄位來自 TWSE TWT93U / TPEx tpex_margin_sbl。
+/// 融資融券欄位來自 TWSE MI_MARGN / TPEx margin/balance(2026-07 起改用新端點)，
+/// 借券餘額欄位來自 TWSE TWT93U / TPEx margin/sbl(2026-07 起改用新端點)。
 /// 使用率(今日餘額/限額)不存欄位，交給前端算，跟三大法人買賣超的「張數」換算做法一致。
 /// </summary>
 public class MarginTradingDetail

@@ -58,6 +58,9 @@ public class WorkerApiClient
     public Task<(int Added, int Updated, int Unchanged)> UpsertMarginAsync(DateOnly date, IEnumerable<MarginTradingDetail> details) =>
         PostUpsertAsync("/api/write/margin", date, details.Select(ToRow));
 
+    public Task<(int Added, int Updated, int Unchanged)> UpsertForeignShareholdingAsync(DateOnly date, IEnumerable<ForeignShareholdingDetail> details) =>
+        PostUpsertAsync("/api/write/foreign-shareholding", date, details.Select(ToRow));
+
     // 給一次性搬遷腳本用：搬遷是直接從 Google Sheet 的原始儲存格資料組 row，
     // 不需要先還原成完整的 InstitutionalTradeDetail/MarginTradingDetail 物件再轉一次。
     public Task<(int Added, int Updated, int Unchanged)> UpsertInstitutionalRawAsync(DateOnly date, IEnumerable<object> rows) =>
@@ -142,6 +145,18 @@ public class WorkerApiClient
         sblAdjustment = d.SblAdjustment,
         sblBalance = d.SblBalance,
         sblQuota = d.SblQuota,
+    };
+
+    private static object ToRow(ForeignShareholdingDetail d) => new
+    {
+        market = d.Market == Market.Listed ? "Listed" : "OTC",
+        stockCode = d.StockCode,
+        stockName = d.StockName,
+        issuedShares = d.IssuedShares,
+        availableShares = d.AvailableShares,
+        heldShares = d.HeldShares,
+        availableRatio = d.AvailableRatio,
+        heldRatio = d.HeldRatio,
     };
 
     private class WatchlistResponse
