@@ -345,9 +345,9 @@ static async Task BackfillNewStocksAsync(
 
     // 三份資料表各自獨立判斷，例如剛新增「外資持股比率」這份表時，既有股票的三大法人資料
     // 已經齊全不需要回補，但這份表是全新的，仍然需要幫既有股票補歷史資料。
-    var needsInstitutional = watchlist.Where(c => NeedsBackfill(institutionalEarliest, c)).ToHashSet();
-    var needsMargin = watchlist.Where(c => NeedsBackfill(marginEarliest, c)).ToHashSet();
-    var needsForeignShareholding = watchlist.Where(c => NeedsBackfill(foreignShareholdingEarliest, c)).ToHashSet();
+    var needsInstitutional = watchlist.Where(c => NeedsBackfill(institutionalEarliest, c)).ToList();
+    var needsMargin = watchlist.Where(c => NeedsBackfill(marginEarliest, c)).ToList();
+    var needsForeignShareholding = watchlist.Where(c => NeedsBackfill(foreignShareholdingEarliest, c)).ToList();
     var stocksNeedingAny = needsInstitutional.Union(needsMargin).Union(needsForeignShareholding).ToList();
 
     if (stocksNeedingAny.Count == 0)
@@ -356,6 +356,9 @@ static async Task BackfillNewStocksAsync(
     }
 
     Console.WriteLine($"偵測到 {stocksNeedingAny.Count} 檔股票缺少從 {historyStartDate:yyyy-MM-dd} 開始的歷史資料，自動回補中：{string.Join(", ", stocksNeedingAny)}");
+    Console.WriteLine($"  三大法人：{string.Join(", ", needsInstitutional)}");
+    Console.WriteLine($"  融資融券：{string.Join(", ", needsMargin)}");
+    Console.WriteLine($"  外資持股比率：{string.Join(", ", needsForeignShareholding)}");
 
     // 刻意從「昨天」往回補到歷史起始日，而不是從起始日往前補：這樣萬一這次執行被 TWSE 中斷，
     // 已經補到的都是「比較新」的日期，GetEarliestDateByCodeAsync 抓到的最早日期依然會比門檻晚，
@@ -373,73 +376,68 @@ static async Task BackfillNewStocksAsync(
     // 不要繼續對已經封鎖自己的來源送更多請求，留到下次排程再繼續。
     const int backfillDelayMs = 1000;
 
-    foreach (var code in stocksNeedingAny)
+    // 以「日期」為主迴圈、股票為次，而不是「股票」為主迴圈：TWSE/TPEx 這幾支 API 本來就是回傳
+    // 整個市場當天的資料，過去逐股票分開打，等於同一天的整包市場資料被重複抓了 N 次(N=待補股票數)，
+    // 既浪費又更容易觸發 TWSE 防濫用機制。改成同一天要補的股票一次打包處理，不管有幾支股票在排隊，
+    // 每天對 TWSE/TPEx 的請求數都是固定的。這樣做還有個好處：萬一真的被封鎖，所有待補股票都已經
+    // 公平地補到同樣深的日期，不會像過去那樣「前面的股票補到一半，後面排隊的股票完全沒被碰到」。
+    foreach (var targetDate in backfillDates)
     {
-        var doInstitutional = needsInstitutional.Contains(code);
-        var doMargin = needsMargin.Contains(code);
-        var doForeignShareholding = needsForeignShareholding.Contains(code);
-        var singleStockWatchlist = new List<string> { code };
-
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 開始自動回補股票代號 {code}(三大法人：{(doInstitutional ? "是" : "否")}，融資融券：{(doMargin ? "是" : "否")}，外資持股比率：{(doForeignShareholding ? "是" : "否")})，範圍 {yesterday:yyyy-MM-dd} 往回補到 {historyStartDate:yyyy-MM-dd}...");
-
-        foreach (var targetDate in backfillDates)
+        if (needsInstitutional.Count > 0)
         {
-            if (doInstitutional)
+            try
             {
-                try
-                {
-                    await ProcessInstitutionalDateAsync(targetDate, singleStockWatchlist, api, twse, tpex);
-                }
-                catch (Exception ex) when (IsTwseBlocked(ex))
-                {
-                    Console.WriteLine($"警告：TWSE 疑似暫時封鎖本次執行的來源(收到 307 導向)，立即停止本次歷史回補，留到下次排程接著補。");
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"警告：{targetDate:yyyy-MM-dd} 三大法人處理失敗，跳過並繼續下一天。錯誤：{ex.Message}");
-                }
+                await ProcessInstitutionalDateAsync(targetDate, needsInstitutional, api, twse, tpex);
             }
-
-            if (doMargin)
+            catch (Exception ex) when (IsTwseBlocked(ex))
             {
-                try
-                {
-                    await ProcessMarginDateAsync(targetDate, singleStockWatchlist, api, twseMargin, tpexMargin);
-                }
-                catch (Exception ex) when (IsTwseBlocked(ex))
-                {
-                    Console.WriteLine($"警告：TWSE 疑似暫時封鎖本次執行的來源(收到 307 導向)，立即停止本次歷史回補，留到下次排程接著補。");
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"警告：{targetDate:yyyy-MM-dd} 融資融券處理失敗，跳過並繼續下一天。錯誤：{ex.Message}");
-                }
+                Console.WriteLine("警告：TWSE 疑似暫時封鎖本次執行的來源(收到 307 導向)，立即停止本次歷史回補，留到下次排程接著補。");
+                return;
             }
-
-            if (doForeignShareholding)
+            catch (Exception ex)
             {
-                try
-                {
-                    await ProcessForeignShareholdingDateAsync(targetDate, singleStockWatchlist, api, foreignShareholding);
-                }
-                catch (Exception ex) when (IsTwseBlocked(ex))
-                {
-                    Console.WriteLine($"警告：TWSE 疑似暫時封鎖本次執行的來源(收到 307 導向)，立即停止本次歷史回補，留到下次排程接著補。");
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"警告：{targetDate:yyyy-MM-dd} 外資持股比率處理失敗，跳過並繼續下一天。錯誤：{ex.Message}");
-                }
+                Console.WriteLine($"警告：{targetDate:yyyy-MM-dd} 三大法人回補處理失敗，跳過並繼續下一天。錯誤：{ex.Message}");
             }
-
-            await Task.Delay(backfillDelayMs);
         }
 
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 股票代號 {code} 的歷史回補完成。");
+        if (needsMargin.Count > 0)
+        {
+            try
+            {
+                await ProcessMarginDateAsync(targetDate, needsMargin, api, twseMargin, tpexMargin);
+            }
+            catch (Exception ex) when (IsTwseBlocked(ex))
+            {
+                Console.WriteLine("警告：TWSE 疑似暫時封鎖本次執行的來源(收到 307 導向)，立即停止本次歷史回補，留到下次排程接著補。");
+                return;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"警告：{targetDate:yyyy-MM-dd} 融資融券回補處理失敗，跳過並繼續下一天。錯誤：{ex.Message}");
+            }
+        }
+
+        if (needsForeignShareholding.Count > 0)
+        {
+            try
+            {
+                await ProcessForeignShareholdingDateAsync(targetDate, needsForeignShareholding, api, foreignShareholding);
+            }
+            catch (Exception ex) when (IsTwseBlocked(ex))
+            {
+                Console.WriteLine("警告：TWSE 疑似暫時封鎖本次執行的來源(收到 307 導向)，立即停止本次歷史回補，留到下次排程接著補。");
+                return;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"警告：{targetDate:yyyy-MM-dd} 外資持股比率回補處理失敗，跳過並繼續下一天。錯誤：{ex.Message}");
+            }
+        }
+
+        await Task.Delay(backfillDelayMs);
     }
+
+    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 歷史回補完成。");
 }
 
 // TWSE 對短時間內大量請求的來源會回傳 307 導向到封鎖頁面(而非單純的錯誤狀態碼)，
