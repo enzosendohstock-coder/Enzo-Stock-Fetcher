@@ -10,6 +10,10 @@ on:
         description: '要補抓的日期 (格式 yyyyMMdd)，留空則抓今天'
         required: false
         default: ''
+      stockCode:
+        description: '只處理這支股票代號，留空則處理整個 Watchlist(手動觸發單一股票補資料用)'
+        required: false
+        default: ''
 
 # 同一時間只能有一個執行序在跑，避免排程跟手動觸發重疊時同時寫入 D1 造成資料競爭。
 # 新的執行會排隊等前一個跑完，不會取消它。
@@ -35,8 +39,12 @@ jobs:
       - name: Run fetcher
         working-directory: src/PPI.Stock.Fetcher
         run: |
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            dotnet run -- ${{ github.event.inputs.date }}
+          if [ -n "${{ github.event.inputs.date }}" ] && [ -n "${{ github.event.inputs.stockCode }}" ]; then
+            dotnet run -- "${{ github.event.inputs.date }}" "${{ github.event.inputs.stockCode }}"
+          elif [ -n "${{ github.event.inputs.date }}" ]; then
+            dotnet run -- "${{ github.event.inputs.date }}"
+          elif [ -n "${{ github.event.inputs.stockCode }}" ]; then
+            dotnet run -- "" "${{ github.event.inputs.stockCode }}"
           else
             dotnet run
           fi
