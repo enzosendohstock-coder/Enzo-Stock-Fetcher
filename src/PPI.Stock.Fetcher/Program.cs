@@ -383,13 +383,23 @@ static async Task BackfillNewStocksAsync(
     // 既浪費又更容易觸發 TWSE 防濫用機制。改成同一天要補的股票一次打包處理，不管有幾支股票在排隊，
     // 每天對 TWSE/TPEx 的請求數都是固定的。這樣做還有個好處：萬一真的被封鎖，所有待補股票都已經
     // 公平地補到同樣深的日期，不會像過去那樣「前面的股票補到一半，後面排隊的股票完全沒被碰到」。
+    //
+    // 每個日期還會再用這次執行「一開始」查到的 earliest 日期，把「這支股票這個日期是不是已經補過了」
+    // 篩選掉：沒有這層篩選的話，每次排程都會從昨天重新整個範圍抓一遍，已經補到一半的股票，之前
+    // 已經補過的日期會被整個重新抓一次(即使寫入時因為資料沒變而顯示「未變」，抓取本身還是會對
+    // TWSE/TPEx 送出請求)，等於每次執行有很大一部分的請求額度都浪費在「確認已經補過的資料還在」，
+    // 真正往前推進的新日期反而很少，實測就是這樣才會出現「回補卡在原地不動」的狀況。
+    bool NotYetCovered(Dictionary<string, DateOnly> earliestByCode, string code, DateOnly date) =>
+        !earliestByCode.TryGetValue(code, out var earliest) || earliest > date;
+
     foreach (var targetDate in backfillDates)
     {
-        if (needsInstitutional.Count > 0)
+        var instCodesForDate = needsInstitutional.Where(c => NotYetCovered(institutionalEarliest, c, targetDate)).ToList();
+        if (instCodesForDate.Count > 0)
         {
             try
             {
-                await ProcessInstitutionalDateAsync(targetDate, needsInstitutional, api, twse, tpex);
+                await ProcessInstitutionalDateAsync(targetDate, instCodesForDate, api, twse, tpex);
             }
             catch (Exception ex) when (IsTwseBlocked(ex))
             {
@@ -402,11 +412,12 @@ static async Task BackfillNewStocksAsync(
             }
         }
 
-        if (needsMargin.Count > 0)
+        var marginCodesForDate = needsMargin.Where(c => NotYetCovered(marginEarliest, c, targetDate)).ToList();
+        if (marginCodesForDate.Count > 0)
         {
             try
             {
-                await ProcessMarginDateAsync(targetDate, needsMargin, api, twseMargin, tpexMargin);
+                await ProcessMarginDateAsync(targetDate, marginCodesForDate, api, twseMargin, tpexMargin);
             }
             catch (Exception ex) when (IsTwseBlocked(ex))
             {
@@ -419,11 +430,12 @@ static async Task BackfillNewStocksAsync(
             }
         }
 
-        if (needsForeignShareholding.Count > 0)
+        var foreignShareholdingCodesForDate = needsForeignShareholding.Where(c => NotYetCovered(foreignShareholdingEarliest, c, targetDate)).ToList();
+        if (foreignShareholdingCodesForDate.Count > 0)
         {
             try
             {
-                await ProcessForeignShareholdingDateAsync(targetDate, needsForeignShareholding, api, foreignShareholding);
+                await ProcessForeignShareholdingDateAsync(targetDate, foreignShareholdingCodesForDate, api, foreignShareholding);
             }
             catch (Exception ex) when (IsTwseBlocked(ex))
             {
@@ -436,7 +448,11 @@ static async Task BackfillNewStocksAsync(
             }
         }
 
-        await Task.Delay(backfillDelayMs);
+        // 三種資料這個日期都已經補齊(前面三個清單都是空的)，代表這天完全不用打任何請求，跳過延遲。
+        if (instCodesForDate.Count > 0 || marginCodesForDate.Count > 0 || foreignShareholdingCodesForDate.Count > 0)
+        {
+            await Task.Delay(backfillDelayMs);
+        }
     }
 
     Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 歷史回補完成。");
