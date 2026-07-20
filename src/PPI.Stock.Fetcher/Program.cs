@@ -50,10 +50,12 @@ if (args.Length > 0 && args[0] == "--migrate-to-d1")
 // 一來讓第二次執行能補上第一次沒抓到的股票、二來讓最近幾天的資料有機會修正 API 偶發的錯誤數字或補上
 // 兩次都失敗的缺漏(例如剛好那天 TWSE 兩次都回傳異常格式，隔天排程還有機會補上)。
 // 上市(TWSE)、上櫃(TPEx，2026-07 起改用新端點)都支援指定任意歷史日期回補。
-// 第二個參數可選：指定只補特定股票代號，用於某支股票剛加入 Watchlist、只想回補這一支的歷史資料，
-// 避免重跑整個清單導致其他已經有資料的股票被重複寫入。
-var explicitDates = args.Length > 0 ? ParseDateArg(args[0]) : null;
-var onlyStockCode = args.Length > 1 ? args[1] : null;
+// 第二個參數可選：指定只補特定股票代號。
+// 兩個參數可以分開用：只給股票代號、不給日期(第一個參數傳空字串)，代表「跟自動排程一樣的
+// 滾動視窗 + 自我修復回補邏輯，但只處理這一支股票」，這是給前端「手動補資料」按鈕用的模式——
+// 沿用同一套安全機制(307 封鎖偵測、只在真的缺資料時才回補)，不用另外寫一條路徑。
+var explicitDates = args.Length > 0 && !string.IsNullOrEmpty(args[0]) ? ParseDateArg(args[0]) : null;
+var onlyStockCode = args.Length > 1 && !string.IsNullOrEmpty(args[1]) ? args[1] : null;
 
 // 新股票自動回補歷史資料一律回補到這個固定日期，不隨時間變動。
 var historyStartDate = new DateOnly(2026, 1, 1);
