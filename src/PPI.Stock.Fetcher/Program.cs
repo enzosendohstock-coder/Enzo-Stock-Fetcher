@@ -102,6 +102,8 @@ var twseMargin = new TwseMarginClient(httpClient);
 var tpexMargin = new TpexMarginClient(httpClient);
 var foreignShareholding = new ForeignShareholdingClient(httpClient);
 var stockPrice = new StockPriceClient(httpClient);
+var monthlyRevenue = new MonthlyRevenueClient(httpClient);
+var quarterlyFinancial = new QuarterlyFinancialClient(httpClient);
 
 var datesToProcess = explicitDates
     ?? Enumerable.Range(0, RollingWindowDays)
@@ -181,6 +183,38 @@ foreach (var targetDate in datesToProcess)
 if (explicitDates == null)
 {
     await BackfillNewStocksAsync(watchlist, api, twse, tpex, twseMargin, tpexMargin, foreignShareholding, stockPrice, historyStartDate);
+}
+
+// 月營收、季報四率+EPS 官方端點本質是「目前最新一期的全市場快照」，沒有日期概念，
+// 不用像上面四份資料放進 datesToProcess 迴圈裡逐日處理，每次執行只需要打一次、upsert 最新一期即可，
+// 這裡是 idempotent 的(同一期重複執行只會是 unchanged，不會重複寫入)。
+// 目前只做「抓最新一期」，歷史回補(新股票補過去幾年的月營收/季報)之後穩定運作一陣子再另外做，
+// 因為官方沒有「整批查某個過去月份/季度全市場」的端點，回補要改成逐股票查詢，量級跟現有四份資料
+// 的回補完全不同，是獨立的一塊工作。
+try
+{
+    await ProcessMonthlyRevenueAsync(watchlist, api, monthlyRevenue);
+}
+catch (Exception ex) when (IsTwseBlocked(ex))
+{
+    Console.WriteLine("警告：TWSE 疑似暫時封鎖本次執行的來源(收到 307 導向)，跳過月營收本次執行。");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"警告：月營收處理失敗。錯誤：{ex.Message}");
+}
+
+try
+{
+    await ProcessQuarterlyFinancialsAsync(watchlist, api, quarterlyFinancial);
+}
+catch (Exception ex) when (IsTwseBlocked(ex))
+{
+    Console.WriteLine("警告：TWSE 疑似暫時封鎖本次執行的來源(收到 307 導向)，跳過季報本次執行。");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"警告：季報處理失敗。錯誤：{ex.Message}");
 }
 
 static async Task FindDuplicatesAsync(GoogleSheetsClient sheets, string spreadsheetId, string sheetName, string dataRange)
@@ -826,4 +860,66 @@ static async Task<Dictionary<string, StockPriceDetail>> FetchStockPriceWithRetry
     }
 
     return prices;
+}
+
+// 月營收、季報沒有「非交易日跳過」這種概念，也不像三大法人那樣「當天全市場都該有資料」，
+// 每月/每季有一段申報期，不同公司會在期間內陸續申報，所以watchlist 裡有股票這次還查不到資料
+// 是正常現象(還沒到申報截止日)，不像其餘四份資料的「查無資料」那樣重試也沒用，這裡不做缺代號重試，
+// 單純印出訊息、跳過即可，下次排程再自然補上。
+static async Task ProcessMonthlyRevenueAsync(List<string> watchlist, WorkerApiClient api, MonthlyRevenueClient monthlyRevenue)
+{
+    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 開始處理月營收資料...");
+
+    var (yearMonth, revenues) = await monthlyRevenue.GetMonthlyRevenueAsync();
+
+    var details = new List<MonthlyRevenueDetail>();
+    foreach (var code in watchlist)
+    {
+        if (revenues.TryGetValue(code, out var detail))
+        {
+            details.Add(detail);
+        }
+        else
+        {
+            Console.WriteLine($"{yearMonth:yyyy-MM} 月營收目前查無股票代號 {code} 的資料，可能還沒到申報截止日，下次排程再確認。");
+        }
+    }
+
+    if (details.Count == 0)
+    {
+        Console.WriteLine($"{yearMonth:yyyy-MM} 月營收沒有任何一檔股票有資料可寫入。");
+        return;
+    }
+
+    var (added, updated, unchanged) = await api.UpsertMonthlyRevenueAsync(yearMonth, details);
+    Console.WriteLine($"{yearMonth:yyyy-MM} 月營收：新增 {added} 筆、更新 {updated} 筆、未變 {unchanged} 筆。");
+}
+
+static async Task ProcessQuarterlyFinancialsAsync(List<string> watchlist, WorkerApiClient api, QuarterlyFinancialClient quarterlyFinancial)
+{
+    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 開始處理季報資料...");
+
+    var (year, quarter, financials) = await quarterlyFinancial.GetQuarterlyFinancialsAsync();
+
+    var details = new List<QuarterlyFinancialDetail>();
+    foreach (var code in watchlist)
+    {
+        if (financials.TryGetValue(code, out var detail))
+        {
+            details.Add(detail);
+        }
+        else
+        {
+            Console.WriteLine($"{year}Q{quarter} 季報目前查無股票代號 {code} 的資料，可能還沒到申報截止日，下次排程再確認。");
+        }
+    }
+
+    if (details.Count == 0)
+    {
+        Console.WriteLine($"{year}Q{quarter} 季報沒有任何一檔股票有資料可寫入。");
+        return;
+    }
+
+    var (added, updated, unchanged) = await api.UpsertQuarterlyFinancialsAsync(year, quarter, details);
+    Console.WriteLine($"{year}Q{quarter} 季報：新增 {added} 筆、更新 {updated} 筆、未變 {unchanged} 筆。");
 }

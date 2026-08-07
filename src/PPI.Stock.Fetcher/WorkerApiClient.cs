@@ -64,6 +64,24 @@ public class WorkerApiClient
     public Task<(int Added, int Updated, int Unchanged)> UpsertStockPriceAsync(DateOnly date, IEnumerable<StockPriceDetail> details) =>
         PostUpsertAsync("/api/write/stock-price", date, details.Select(ToRow));
 
+    public async Task<(int Added, int Updated, int Unchanged)> UpsertMonthlyRevenueAsync(DateOnly yearMonth, IEnumerable<MonthlyRevenueDetail> details)
+    {
+        var body = new { yearMonth = yearMonth.ToString("yyyy-MM"), rows = details.Select(ToRow) };
+        var response = await _httpClient.PostAsJsonAsync($"{_baseUrl}/api/write/monthly-revenue", body, JsonOptions);
+        response.EnsureSuccessStatusCode();
+        var result = await response.Content.ReadFromJsonAsync<UpsertResponse>(JsonOptions);
+        return (result?.Added ?? 0, result?.Updated ?? 0, result?.Unchanged ?? 0);
+    }
+
+    public async Task<(int Added, int Updated, int Unchanged)> UpsertQuarterlyFinancialsAsync(int year, int quarter, IEnumerable<QuarterlyFinancialDetail> details)
+    {
+        var body = new { year, quarter, rows = details.Select(ToRow) };
+        var response = await _httpClient.PostAsJsonAsync($"{_baseUrl}/api/write/quarterly-financials", body, JsonOptions);
+        response.EnsureSuccessStatusCode();
+        var result = await response.Content.ReadFromJsonAsync<UpsertResponse>(JsonOptions);
+        return (result?.Added ?? 0, result?.Updated ?? 0, result?.Unchanged ?? 0);
+    }
+
     // 給一次性搬遷腳本用：搬遷是直接從 Google Sheet 的原始儲存格資料組 row，
     // 不需要先還原成完整的 InstitutionalTradeDetail/MarginTradingDetail 物件再轉一次。
     public Task<(int Added, int Updated, int Unchanged)> UpsertInstitutionalRawAsync(DateOnly date, IEnumerable<object> rows) =>
@@ -175,6 +193,44 @@ public class WorkerApiClient
         volume = d.Volume,
         transactionCount = d.TransactionCount,
         turnoverValue = d.TurnoverValue,
+    };
+
+    private static object ToRow(MonthlyRevenueDetail d) => new
+    {
+        market = d.Market == Market.Listed ? "Listed" : "OTC",
+        stockCode = d.StockCode,
+        stockName = d.StockName,
+        industry = d.Industry,
+        revenue = d.Revenue,
+        revenuePrevMonth = d.RevenuePrevMonth,
+        revenueLastYearMonth = d.RevenueLastYearMonth,
+        momPercent = d.MomPercent,
+        yoyPercent = d.YoyPercent,
+        cumulativeRevenue = d.CumulativeRevenue,
+        cumulativeRevenueLastYear = d.CumulativeRevenueLastYear,
+        cumulativeYoyPercent = d.CumulativeYoyPercent,
+    };
+
+    private static object ToRow(QuarterlyFinancialDetail d) => new
+    {
+        market = d.Market == Market.Listed ? "Listed" : "OTC",
+        stockCode = d.StockCode,
+        stockName = d.StockName,
+        industryCategory = d.IndustryCategory,
+        revenue = d.Revenue,
+        costOfRevenue = d.CostOfRevenue,
+        grossProfit = d.GrossProfit,
+        operatingExpenses = d.OperatingExpenses,
+        operatingIncome = d.OperatingIncome,
+        nonOperatingIncomeExpenses = d.NonOperatingIncomeExpenses,
+        pretaxIncome = d.PretaxIncome,
+        incomeTaxExpense = d.IncomeTaxExpense,
+        netIncome = d.NetIncome,
+        eps = d.Eps,
+        grossMargin = d.GrossMargin,
+        operatingMargin = d.OperatingMargin,
+        pretaxMargin = d.PretaxMargin,
+        netMargin = d.NetMargin,
     };
 
     private class WatchlistResponse
