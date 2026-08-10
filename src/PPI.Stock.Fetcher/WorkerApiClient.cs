@@ -52,6 +52,28 @@ public class WorkerApiClient
         return result;
     }
 
+    // year_month 是 'yyyy-MM'(沒有日)，不能直接用 DateOnly.TryParse，補上 "-01" 當作每月第一天。
+    public async Task<Dictionary<string, DateOnly>> GetEarliestMonthlyRevenueByCodeAsync()
+    {
+        var response = await _httpClient.GetFromJsonAsync<EarliestDateResponse>(
+            $"{_baseUrl}/api/write/earliest-date?table=monthlyRevenue", JsonOptions);
+
+        var result = new Dictionary<string, DateOnly>();
+        if (response?.EarliestDates == null)
+        {
+            return result;
+        }
+
+        foreach (var (code, yearMonthStr) in response.EarliestDates)
+        {
+            if (DateOnly.TryParseExact($"{yearMonthStr}-01", "yyyy-MM-dd", out var date))
+            {
+                result[code] = date;
+            }
+        }
+        return result;
+    }
+
     public Task<(int Added, int Updated, int Unchanged)> UpsertInstitutionalAsync(DateOnly date, IEnumerable<InstitutionalTradeDetail> details) =>
         PostUpsertAsync("/api/write/institutional", date, details.Select(ToRow));
 

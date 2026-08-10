@@ -42,6 +42,37 @@ if (args.Length > 0 && args[0] == "--migrate-to-d1")
     return;
 }
 
+// 月營收歷史回補模式：逐月往回查詢單一股票的歷史營收(mopsov.twse.com.tw)，一路補到指定的起始年月為止。
+// 由 Worker 的 /api/backfill/monthly-revenue 端點觸發(watchlist.html 上「補近期/補2010」兩個按鈕)，
+// 透過 GitHub workflow_dispatch 帶 monthlyRevenueBackfillStockCode/monthlyRevenueBackfillStartYearMonth
+// 兩個參數進來。跟其餘資料的回補邏輯不同(逐月不是逐日、單一股票不是整個 Watchlist)，獨立一個模式處理，
+// 不硬塞進下面共用的日期迴圈。
+if (args.Length > 0 && args[0] == "--backfill-monthly-revenue")
+{
+    if (args.Length < 3)
+    {
+        Console.WriteLine("錯誤：--backfill-monthly-revenue 需要兩個參數：股票代號、回補起始年月(yyyy-MM)。");
+        return;
+    }
+
+    var backfillStockCode = args[1];
+    if (!DateOnly.TryParseExact($"{args[2]}-01", "yyyy-MM-dd", out var backfillStartYearMonth))
+    {
+        Console.WriteLine($"錯誤：無法解析回補起始年月「{args[2]}」，格式應為 yyyy-MM。");
+        return;
+    }
+
+    var backfillWorkerSettings = config.GetSection("WorkerApi").Get<WorkerApiSettings>()
+        ?? throw new InvalidOperationException("找不到 WorkerApi 設定區段，請檢查 appsettings.json。");
+    using var backfillHttpClient = new HttpClient();
+    var backfillApi = new WorkerApiClient(backfillHttpClient, backfillWorkerSettings);
+    var backfillMonthlyRevenue = new MonthlyRevenueClient(backfillHttpClient);
+    var backfillHistoryClient = new MonthlyRevenueHistoryClient(backfillHttpClient);
+
+    await BackfillMonthlyRevenueHistoryAsync(backfillStockCode, backfillStartYearMonth, backfillApi, backfillMonthlyRevenue, backfillHistoryClient);
+    return;
+}
+
 // 支援用命令列參數指定要補抓的日期：
 //   不帶參數                   → 自動處理「今天、往前 RollingWindowDays 天」(排程用)
 //   單一日期 yyyyMMdd          → 只處理這一天
@@ -922,4 +953,114 @@ static async Task ProcessQuarterlyFinancialsAsync(List<string> watchlist, Worker
 
     var (added, updated, unchanged) = await api.UpsertQuarterlyFinancialsAsync(year, quarter, details);
     Console.WriteLine($"{year}Q{quarter} 季報：新增 {added} 筆、更新 {updated} 筆、未變 {unchanged} 筆。");
+}
+
+static async Task BackfillMonthlyRevenueHistoryAsync(
+    string stockCode,
+    DateOnly startYearMonth,
+    WorkerApiClient api,
+    MonthlyRevenueClient monthlyRevenue,
+    MonthlyRevenueHistoryClient historyClient)
+{
+    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 開始回補 {stockCode} 月營收歷史資料，起始年月 {startYearMonth:yyyy-MM}...");
+
+    // 歷史查詢頁面本身沒有 Market/StockName 欄位，用目前最新一期的月營收資料(當期管線已經在跑)反查。
+    var (_, currentRevenues) = await monthlyRevenue.GetMonthlyRevenueAsync();
+    if (!currentRevenues.TryGetValue(stockCode, out var currentDetail))
+    {
+        Console.WriteLine($"警告：{stockCode} 目前最新一期月營收查無資料，無法判斷上市/上櫃別，中止回補。請先確認股票代號正確、且當期管線已經有這支股票的資料。");
+        return;
+    }
+    var market = currentDetail.Market;
+    var stockName = currentDetail.StockName;
+
+    var earliestByCode = await api.GetEarliestMonthlyRevenueByCodeAsync();
+    var lastCompleteMonth = new DateOnly(DateTime.Today.Year, DateTime.Today.Month, 1).AddMonths(-1);
+    var endYearMonth = earliestByCode.TryGetValue(stockCode, out var earliest) ? earliest.AddMonths(-1) : lastCompleteMonth;
+    if (endYearMonth > lastCompleteMonth)
+    {
+        endYearMonth = lastCompleteMonth;
+    }
+
+    if (startYearMonth > endYearMonth)
+    {
+        Console.WriteLine($"{stockCode} 從 {startYearMonth:yyyy-MM} 到 {endYearMonth:yyyy-MM} 已經有資料了，不需要回補。");
+        return;
+    }
+
+    Console.WriteLine($"回補範圍：{startYearMonth:yyyy-MM} ~ {endYearMonth:yyyy-MM}(由新到舊查詢，查到掛牌前的月份會自動停止)。");
+
+    // 由新到舊查詢：查到「查無資料」代表已經回溯到掛牌之前，可以安全停止，不用事先知道掛牌日期。
+    // MoM% 沒辦法在這個方向現算(需要「更早一個月」的營收，但這個方向是先拿到比較新的月份)，
+    // 所以先只收集原始資料，全部查完後再依時間正序算 MoM%，見下面第二段迴圈。
+    var collected = new List<(DateOnly YearMonth, MonthlyRevenueDetail Detail)>();
+    var current = endYearMonth;
+    while (current >= startYearMonth)
+    {
+        MonthlyRevenueDetail? detail;
+        try
+        {
+            detail = await historyClient.GetMonthlyRevenueAsync(stockCode, stockName, market, current, previousMonthRevenue: null);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"警告：{current:yyyy-MM} 查詢失敗，跳過並繼續往回查。錯誤：{ex.Message}");
+            current = current.AddMonths(-1);
+            await Task.Delay(1000);
+            continue;
+        }
+
+        if (detail == null)
+        {
+            Console.WriteLine($"{current:yyyy-MM}：查無資料(可能已經回溯到掛牌之前)，停止往回查詢。");
+            break;
+        }
+
+        collected.Add((current, detail));
+        current = current.AddMonths(-1);
+
+        // 對 MOPS 這個舊式查詢頁面連續送出大量請求前先間隔一下，降低觸發防爬蟲機制的機會。
+        await Task.Delay(800);
+    }
+
+    if (collected.Count == 0)
+    {
+        Console.WriteLine($"{stockCode} 沒有查到任何可回補的月份。");
+        return;
+    }
+
+    // 收集完成後照時間正序排(舊到新)，才能正確算出每個月相對「前一個月」的 MoM%。
+    collected.Reverse();
+
+    var totalAdded = 0;
+    var totalUpdated = 0;
+    var totalUnchanged = 0;
+    long? previousMonthRevenue = null;
+
+    foreach (var (yearMonth, raw) in collected)
+    {
+        var withMom = new MonthlyRevenueDetail
+        {
+            StockCode = raw.StockCode,
+            StockName = raw.StockName,
+            Market = raw.Market,
+            Industry = raw.Industry,
+            Revenue = raw.Revenue,
+            RevenuePrevMonth = previousMonthRevenue ?? 0,
+            MomPercent = previousMonthRevenue is > 0 ? (raw.Revenue - previousMonthRevenue.Value) * 100.0 / previousMonthRevenue.Value : null,
+            RevenueLastYearMonth = raw.RevenueLastYearMonth,
+            YoyPercent = raw.YoyPercent,
+            CumulativeRevenue = raw.CumulativeRevenue,
+            CumulativeRevenueLastYear = raw.CumulativeRevenueLastYear,
+            CumulativeYoyPercent = raw.CumulativeYoyPercent,
+        };
+
+        var (added, updated, unchanged) = await api.UpsertMonthlyRevenueAsync(yearMonth, new[] { withMom });
+        totalAdded += added;
+        totalUpdated += updated;
+        totalUnchanged += unchanged;
+        previousMonthRevenue = raw.Revenue;
+    }
+
+    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {stockCode} 月營收回補完成，共處理 {collected.Count} 個月({collected[0].YearMonth:yyyy-MM} ~ {collected[^1].YearMonth:yyyy-MM})：新增 {totalAdded} 筆、更新 {totalUpdated} 筆、未變 {totalUnchanged} 筆。");
 }
