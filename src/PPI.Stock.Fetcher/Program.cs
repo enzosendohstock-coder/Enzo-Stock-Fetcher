@@ -974,48 +974,76 @@ static async Task BackfillMonthlyRevenueHistoryAsync(
     var market = currentDetail.Market;
     var stockName = currentDetail.StockName;
 
-    var earliestByCode = await api.GetEarliestMonthlyRevenueByCodeAsync();
+    // 刻意不用「最早已有資料的年月」來縮小回補範圍——MOPS 偶爾會暫時性擋掉/回應異常，
+    // 如果只看最早日期決定要不要跳過，一旦中途某次執行留下缺口(見下面重試邏輯的註解)，
+    // 之後重新點同一個按鈕會誤判「已經有資料」而完全跳過，缺口永遠補不回來。
+    // 每次都重新掃過整個要求範圍，靠 upsert 本身冪等(已經正確的資料只會是 unchanged)，
+    // 換取「重新執行一次就能自動補齊任何缺口」的自我修復能力，用請求量換可靠性。
     var lastCompleteMonth = new DateOnly(DateTime.Today.Year, DateTime.Today.Month, 1).AddMonths(-1);
-    var endYearMonth = earliestByCode.TryGetValue(stockCode, out var earliest) ? earliest.AddMonths(-1) : lastCompleteMonth;
-    if (endYearMonth > lastCompleteMonth)
-    {
-        endYearMonth = lastCompleteMonth;
-    }
+    var endYearMonth = lastCompleteMonth;
 
     if (startYearMonth > endYearMonth)
     {
-        Console.WriteLine($"{stockCode} 從 {startYearMonth:yyyy-MM} 到 {endYearMonth:yyyy-MM} 已經有資料了，不需要回補。");
+        Console.WriteLine($"{stockCode} 起始年月 {startYearMonth:yyyy-MM} 晚於目前最新完整月份 {endYearMonth:yyyy-MM}，沒有需要回補的範圍。");
         return;
     }
 
-    Console.WriteLine($"回補範圍：{startYearMonth:yyyy-MM} ~ {endYearMonth:yyyy-MM}(由新到舊查詢，查到掛牌前的月份會自動停止)。");
+    Console.WriteLine($"回補範圍：{startYearMonth:yyyy-MM} ~ {endYearMonth:yyyy-MM}(由新到舊查詢)。");
 
-    // 由新到舊查詢：查到「查無資料」代表已經回溯到掛牌之前，可以安全停止，不用事先知道掛牌日期。
-    // MoM% 沒辦法在這個方向現算(需要「更早一個月」的營收，但這個方向是先拿到比較新的月份)，
-    // 所以先只收集原始資料，全部查完後再依時間正序算 MoM%，見下面第二段迴圈。
+    // 由新到舊查詢。MoM% 沒辦法在這個方向現算(需要「更早一個月」的營收，但這個方向是先拿到比較新的
+    // 月份)，所以先只收集原始資料，全部查完後再依時間正序算 MoM%，見下面第二段迴圈。
+    //
+    // 「查無資料」有兩種可能：真的已經回溯到掛牌之前，或是 MOPS 暫時性擋掉/回應異常剛好也解析不出
+    // 資料(實測遇過：某次執行在某個月份卡住直接判定「已到掛牌前」而中止，但那個月份重新查其實有
+    // 正常資料)。這裡遇到查無資料時，同一個月重試兩次(每次多等 3 秒)，重試後還是沒有才計入
+    // 「連續無資料月數」；只有連續 3 個月都真的沒資料，才判定是回溯到掛牌之前並停止——單一個月的
+    // 暫時性問題不會再讓後面幾十年的資料整段被放棄掉。
+    const int maxRetriesPerMonth = 2;
+    const int consecutiveNullMonthsToStop = 3;
+
     var collected = new List<(DateOnly YearMonth, MonthlyRevenueDetail Detail)>();
+    var consecutiveNullMonths = 0;
     var current = endYearMonth;
     while (current >= startYearMonth)
     {
-        MonthlyRevenueDetail? detail;
-        try
+        MonthlyRevenueDetail? detail = null;
+        for (var attempt = 0; attempt <= maxRetriesPerMonth; attempt++)
         {
-            detail = await historyClient.GetMonthlyRevenueAsync(stockCode, stockName, market, current, previousMonthRevenue: null);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"警告：{current:yyyy-MM} 查詢失敗，跳過並繼續往回查。錯誤：{ex.Message}");
-            current = current.AddMonths(-1);
-            await Task.Delay(1000);
-            continue;
+            try
+            {
+                detail = await historyClient.GetMonthlyRevenueAsync(stockCode, stockName, market, current, previousMonthRevenue: null);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"警告：{current:yyyy-MM} 查詢失敗(第 {attempt + 1} 次)，錯誤：{ex.Message}");
+                detail = null;
+            }
+
+            if (detail != null)
+            {
+                break;
+            }
+            if (attempt < maxRetriesPerMonth)
+            {
+                await Task.Delay(3000);
+            }
         }
 
         if (detail == null)
         {
-            Console.WriteLine($"{current:yyyy-MM}：查無資料(可能已經回溯到掛牌之前)，停止往回查詢。");
-            break;
+            consecutiveNullMonths++;
+            Console.WriteLine($"{current:yyyy-MM}：重試 {maxRetriesPerMonth} 次後仍查無資料(連續第 {consecutiveNullMonths} 個月)。");
+            if (consecutiveNullMonths >= consecutiveNullMonthsToStop)
+            {
+                Console.WriteLine($"連續 {consecutiveNullMonths} 個月都查無資料，判定已回溯到掛牌之前，停止往回查詢。");
+                break;
+            }
+            current = current.AddMonths(-1);
+            await Task.Delay(800);
+            continue;
         }
 
+        consecutiveNullMonths = 0;
         collected.Add((current, detail));
         current = current.AddMonths(-1);
 
