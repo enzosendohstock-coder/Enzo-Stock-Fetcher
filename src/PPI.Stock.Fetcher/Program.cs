@@ -1219,8 +1219,11 @@ static async Task AutoBackfillQuarterlyFinancialsAsync(
     var deepStart = (Year: 2013, Quarter: 1);
     var earliest = await api.GetEarliestQuarterByCodeAsync();
 
+    // e(目前最早回補到的年季) 比 deepStart(2013 Q1) 還「晚」，代表還沒補到門檻，需要回補。
+    // 年份要用 > 不是 <——寫反的話，資料只到最新一期(例如2026Q2)的股票會被誤判成「已經補齊」，
+    // 這裡曾經真的因為寫反過一次，導致自動回補跑起來直接判定不用做事、18秒就結束。
     bool NeedsBackfill(string code) =>
-        !earliest.TryGetValue(code, out var e) || e.Year < deepStart.Year ||
+        !earliest.TryGetValue(code, out var e) || e.Year > deepStart.Year ||
         (e.Year == deepStart.Year && e.Quarter > deepStart.Quarter);
 
     var stocksNeedingBackfill = watchlist.Where(NeedsBackfill).ToList();
