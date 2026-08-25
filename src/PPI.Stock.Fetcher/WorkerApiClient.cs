@@ -52,6 +52,30 @@ public class WorkerApiClient
         return result;
     }
 
+    // quarterly_financials 沒有單一可排序欄位，Worker 那邊用 year*10+quarter 湊出排序鍵再轉字串
+    // 回傳(例如 "20131" 代表 2013 年第 1 季)，這裡拆回 (Year, Quarter)；quarter 固定個位數，
+    // 字串長度固定 5 碼(年份 4 碼)，直接切割不用額外解析。
+    public async Task<Dictionary<string, (int Year, int Quarter)>> GetEarliestQuarterByCodeAsync()
+    {
+        var response = await _httpClient.GetFromJsonAsync<EarliestDateResponse>(
+            $"{_baseUrl}/api/write/earliest-date?table=quarterlyFinancials", JsonOptions);
+
+        var result = new Dictionary<string, (int Year, int Quarter)>();
+        if (response?.EarliestDates == null)
+        {
+            return result;
+        }
+
+        foreach (var (code, key) in response.EarliestDates)
+        {
+            if (key.Length == 5 && int.TryParse(key[..4], out var year) && int.TryParse(key[4..], out var quarter))
+            {
+                result[code] = (year, quarter);
+            }
+        }
+        return result;
+    }
+
     public Task<(int Added, int Updated, int Unchanged)> UpsertInstitutionalAsync(DateOnly date, IEnumerable<InstitutionalTradeDetail> details) =>
         PostUpsertAsync("/api/write/institutional", date, details.Select(ToRow));
 

@@ -43,7 +43,7 @@ if (args.Length > 0 && args[0] == "--migrate-to-d1")
 }
 
 // 月營收歷史回補模式：逐月往回查詢單一股票的歷史營收(mopsov.twse.com.tw)，一路補到指定的起始年月為止。
-// 由 Worker 的 /api/backfill/monthly-revenue 端點觸發(watchlist.html 上「補近期/補2010」兩個按鈕)，
+// 由 Worker 的 /api/backfill/monthly-revenue 端點觸發(watchlist.html 上「補近期/補2013」兩個按鈕)，
 // 透過 GitHub workflow_dispatch 帶 monthlyRevenueBackfillStockCode/monthlyRevenueBackfillStartYearMonth
 // 兩個參數進來。跟其餘資料的回補邏輯不同(逐月不是逐日、單一股票不是整個 Watchlist)，獨立一個模式處理，
 // 不硬塞進下面共用的日期迴圈。
@@ -75,9 +75,9 @@ if (args.Length > 0 && args[0] == "--backfill-monthly-revenue")
 
 // 月營收自動回補模式：掃描整個 Watchlist，用 /api/write/earliest-date?table=monthlyRevenue
 // 這個既有端點(跟四份資料自動回補新股票用的是同一支)查出每支股票目前月營收資料回補到哪個年月，
-// 只有「還沒補到 2010 年起」的股票才會真的觸發逐月查詢，大部分股票早就補齊了，這個檢查本身很便宜，
+// 只有「還沒補到 2013 年起」的股票才會真的觸發逐月查詢，大部分股票早就補齊了，這個檢查本身很便宜，
 // 不會對 MOPS 造成負擔。由 Worker 的 Cron Trigger 在白天 08:00、17:00(跟既有 17:30/18:30 例行抓取、
-// 06:00 期貨快照都錯開)觸發，取代原本只能在 watchlist.html 手動點「補2010」按鈕逐支回補的做法。
+// 06:00 期貨快照都錯開)觸發，取代原本只能在 watchlist.html 手動點「補2013」按鈕逐支回補的做法。
 if (args.Length > 0 && args[0] == "--auto-backfill-monthly-revenue")
 {
     var autoBackfillWorkerSettings = config.GetSection("WorkerApi").Get<WorkerApiSettings>()
@@ -89,6 +89,33 @@ if (args.Length > 0 && args[0] == "--auto-backfill-monthly-revenue")
     var autoBackfillHistoryClient = new MonthlyRevenueHistoryClient(autoBackfillHttpClient);
 
     await AutoBackfillMonthlyRevenueAsync(autoBackfillWatchlist, autoBackfillApi, autoBackfillMonthlyRevenue, autoBackfillHistoryClient);
+    return;
+}
+
+// 季報自動回補模式：MOPS 的季報彙總查詢頁面是「整個市場一次查」(不是逐股票)，一次請求就能拿到
+// 該市場所有公司這一季的資料，不需要像月營收那樣逐股票判斷缺口——用 Watchlist 裡「還沒補到
+// 2013年Q1」的股票數量決定要不要觸發，有缺口就整批往回補到 2013Q1 為止。
+// 季報只有法規規定的申報期限前後才會有新資料(一般業Q1~Q3申報後45天內、金控業更晚幾天、
+// 年報3月底)，非申報期間查了也是白查，所以額外多一層「今天在不在申報期間附近」的日期檢查，
+// 不在檢查範圍內直接跳過，不會浪費請求。由 Worker 的 Cron Trigger 在平日(週一~週五)白天
+// 08:00、17:00 觸發，跟月營收共用同樣的時間點但是各自獨立判斷、獨立的 workflow input。
+if (args.Length > 0 && args[0] == "--auto-backfill-quarterly-financials")
+{
+    var autoQfBackfillWorkerSettings = config.GetSection("WorkerApi").Get<WorkerApiSettings>()
+        ?? throw new InvalidOperationException("找不到 WorkerApi 設定區段，請檢查 appsettings.json。");
+
+    if (!IsQuarterlyFilingWindow(DateOnly.FromDateTime(DateTime.Today)))
+    {
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 今天不在季報申報期間附近，跳過本次季報自動回補檢查。");
+        return;
+    }
+
+    using var autoQfBackfillHttpClient = new HttpClient();
+    var autoQfBackfillApi = new WorkerApiClient(autoQfBackfillHttpClient, autoQfBackfillWorkerSettings);
+    var autoQfBackfillWatchlist = await autoQfBackfillApi.GetWatchlistAsync();
+    var autoQfBackfillHistoryClient = new QuarterlyFinancialHistoryClient(autoQfBackfillHttpClient);
+
+    await AutoBackfillQuarterlyFinancialsAsync(autoQfBackfillWatchlist, autoQfBackfillApi, autoQfBackfillHistoryClient);
     return;
 }
 
@@ -1120,20 +1147,25 @@ static async Task AutoBackfillMonthlyRevenueAsync(
 {
     Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 開始自動偵測月營收歷史缺口...");
 
-    // 跟 watchlist.html「補2010起」按鈕同一個回補起始年月，自動化直接以這個門檻為準，
+    // 跟 watchlist.html「補2013起」按鈕同一個回補起始年月，自動化直接以這個門檻為準，
     // 不像四份資料的新股票回補那樣分階段——月營收回補的請求量遠低於整批市場資料回補，
     // 直接一次補到底即可，不需要先補近期再補完整。
-    var deepStart = new DateOnly(2010, 1, 1);
+    // 2013-01 是這個門檻，不是 2010：實測過 MOPS 的個股月營收查詢頁面(ajax_t05st10_ifrs)
+    // 本身只有 2013 年(IFRS上路)之後的資料，2013 年以前是另一份不同表格結構的舊報表，
+    // 目前沒有支援。設成更早的年月只會讓每次執行都白白撞到這道牆重新掃過同一段查無資料的
+    // 範圍，還會讓「earliest 已經到門檻」這個跳過判斷永遠不成立，變成每次排程都重新整批
+    // 掃描全部股票，完全失去「只在真的有缺口時才觸發」的設計初衷。
+    var deepStart = new DateOnly(2013, 1, 1);
     var earliest = await api.GetEarliestDateByCodeAsync("monthlyRevenue");
 
     var stocksNeedingBackfill = watchlist.Where(c => !earliest.TryGetValue(c, out var e) || e > deepStart).ToList();
     if (stocksNeedingBackfill.Count == 0)
     {
-        Console.WriteLine("所有追蹤股票的月營收歷史都已經回補到 2010 年起，本次不需要動作。");
+        Console.WriteLine("所有追蹤股票的月營收歷史都已經回補到 2013 年起，本次不需要動作。");
         return;
     }
 
-    Console.WriteLine($"偵測到 {stocksNeedingBackfill.Count} 檔股票月營收歷史還沒補到 2010 年起，自動依序回補：{string.Join(", ", stocksNeedingBackfill)}");
+    Console.WriteLine($"偵測到 {stocksNeedingBackfill.Count} 檔股票月營收歷史還沒補到 2013 年起，自動依序回補：{string.Join(", ", stocksNeedingBackfill)}");
 
     foreach (var stockCode in stocksNeedingBackfill)
     {
@@ -1152,4 +1184,125 @@ static async Task AutoBackfillMonthlyRevenueAsync(
     }
 
     Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 月營收自動回補整輪處理完成。");
+}
+
+// 一般行業申報期限：Q1報 5/15、Q2報 8/14、Q3報 11/14、年報(含Q4) 3/31；金控業普遍晚幾天
+// (5/30、8/31、11/29、3/31同)。這裡用月份層級的寬鬆區間涵蓋兩者+緩衝，不用精確到日——
+// 寧可多檢查幾天也不要抓太窄漏掉真正的公佈期間。區間之外完全不查，避免對 MOPS 送無意義的請求。
+static bool IsQuarterlyFilingWindow(DateOnly today)
+{
+    var m = today.Month;
+    var d = today.Day;
+    if (m == 5 || m == 8 || m == 11) return true;         // Q1/Q2/Q3 申報期整月
+    if (m == 9 && d <= 10) return true;                    // Q2 金控業 8/31 的緩衝
+    if (m == 3 && d >= 15) return true;                    // 年報申報期前段(3/31前)
+    if (m == 4 && d <= 15) return true;                    // 年報申報期緩衝(3/31後)
+    return false;
+}
+
+// 今天所屬的「上一個完整日曆季」：例行抓取(ProcessQuarterlyFinancialsAsync)本身每天都會打一次
+// 官方「最新一期」端點，自動負責抓最新一季，這裡的回補只需要負責更早的歷史缺口，用「上一季」
+// 當作往回掃描的起點就足夠、不用精算「這一季實際上是不是已經全部公司都申報完了」這種細節。
+static (int Year, int Quarter) PreviousQuarter(DateOnly today)
+{
+    var currentQuarter = (today.Month - 1) / 3 + 1;
+    return currentQuarter == 1 ? (today.Year - 1, 4) : (today.Year, currentQuarter - 1);
+}
+
+static async Task AutoBackfillQuarterlyFinancialsAsync(
+    List<string> watchlist,
+    WorkerApiClient api,
+    QuarterlyFinancialHistoryClient historyClient)
+{
+    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 開始自動偵測季報歷史缺口...");
+
+    var deepStart = (Year: 2013, Quarter: 1);
+    var earliest = await api.GetEarliestQuarterByCodeAsync();
+
+    bool NeedsBackfill(string code) =>
+        !earliest.TryGetValue(code, out var e) || e.Year < deepStart.Year ||
+        (e.Year == deepStart.Year && e.Quarter > deepStart.Quarter);
+
+    var stocksNeedingBackfill = watchlist.Where(NeedsBackfill).ToList();
+    if (stocksNeedingBackfill.Count == 0)
+    {
+        Console.WriteLine("所有追蹤股票的季報歷史都已經回補到 2013 年 Q1 起，本次不需要動作。");
+        return;
+    }
+
+    Console.WriteLine($"偵測到 {stocksNeedingBackfill.Count} 檔股票季報歷史還沒補到 2013 年 Q1 起，自動往回逐季回補：{string.Join(", ", stocksNeedingBackfill)}");
+
+    // 季報彙總查詢是「整個市場一次查」，不是逐股票查，所以外層迴圈是「一季一季」往回掃，
+    // 每一季只需要各打一次上市、一次上櫃(各自內部已經平行處理四率+損益表)，跟股票數量無關，
+    // 不管 Watchlist 有幾支股票在排隊等回補，總請求量都是固定的。
+    const int maxRetriesPerQuarter = 2;
+    const int consecutiveEmptyQuartersToStop = 3;
+
+    var (year, quarter) = PreviousQuarter(DateOnly.FromDateTime(DateTime.Today));
+    var consecutiveEmptyQuarters = 0;
+
+    while (year > deepStart.Year || (year == deepStart.Year && quarter >= deepStart.Quarter))
+    {
+        Dictionary<string, QuarterlyFinancialDetail> merged = new();
+        var gotAnyData = false;
+
+        foreach (var market in new[] { Market.Listed, Market.Otc })
+        {
+            for (var attempt = 0; attempt <= maxRetriesPerQuarter; attempt++)
+            {
+                try
+                {
+                    var rows = await historyClient.GetQuarterAsync(market, year, quarter);
+                    if (rows.Count > 0)
+                    {
+                        gotAnyData = true;
+                        foreach (var (code, detail) in rows)
+                        {
+                            merged[code] = detail;
+                        }
+                    }
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"警告：{year}Q{quarter} {market} 查詢失敗(第 {attempt + 1} 次)，錯誤：{ex.Message}");
+                    if (attempt < maxRetriesPerQuarter)
+                    {
+                        await Task.Delay(3000);
+                    }
+                }
+            }
+        }
+
+        if (!gotAnyData)
+        {
+            consecutiveEmptyQuarters++;
+            Console.WriteLine($"{year}Q{quarter}：查無資料(連續第 {consecutiveEmptyQuarters} 季)。");
+            if (consecutiveEmptyQuarters >= consecutiveEmptyQuartersToStop)
+            {
+                Console.WriteLine($"連續 {consecutiveEmptyQuarters} 季都查無資料，判定已回溯到 2013 年 IFRS 上路之前，停止往回查詢。");
+                break;
+            }
+            quarter--;
+            if (quarter == 0) { quarter = 4; year--; }
+            await Task.Delay(1000);
+            continue;
+        }
+
+        consecutiveEmptyQuarters = 0;
+
+        // 只挑 Watchlist 裡的股票寫入，跟其餘幾份資料的做法一致，不把整個市場的資料都存進 D1。
+        var watchlistRows = merged.Where(p => watchlist.Contains(p.Key)).Select(p => p.Value).ToList();
+        if (watchlistRows.Count > 0)
+        {
+            var (added, updated, unchanged) = await api.UpsertQuarterlyFinancialsAsync(year, quarter, watchlistRows);
+            Console.WriteLine($"{year}Q{quarter}：新增 {added} 筆、更新 {updated} 筆、未變 {unchanged} 筆。");
+        }
+
+        quarter--;
+        if (quarter == 0) { quarter = 4; year--; }
+        await Task.Delay(1000);
+    }
+
+    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 季報自動回補整輪處理完成。");
 }
