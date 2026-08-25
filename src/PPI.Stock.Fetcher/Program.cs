@@ -110,7 +110,10 @@ if (args.Length > 0 && args[0] == "--auto-backfill-quarterly-financials")
         return;
     }
 
-    using var autoQfBackfillHttpClient = new HttpClient();
+    // 實測從 GitHub Actions 執行時，MOPS 對某些季別的查詢會整整卡滿預設 100 秒逾時才失敗
+    // (不是慢、是完全沒回應)，用預設逾時的話光重試 3 次同一個市場就要燒掉 5 分鐘。縮短逾時
+    // 時間讓失敗判定更快，不影響真正會成功的請求(實測正常回應都在數秒內)。
+    using var autoQfBackfillHttpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(25) };
     var autoQfBackfillApi = new WorkerApiClient(autoQfBackfillHttpClient, autoQfBackfillWorkerSettings);
     var autoQfBackfillWatchlist = await autoQfBackfillApi.GetWatchlistAsync();
     var autoQfBackfillHistoryClient = new QuarterlyFinancialHistoryClient(autoQfBackfillHttpClient);
@@ -1238,7 +1241,10 @@ static async Task AutoBackfillQuarterlyFinancialsAsync(
     // 季報彙總查詢是「整個市場一次查」，不是逐股票查，所以外層迴圈是「一季一季」往回掃，
     // 每一季只需要各打一次上市、一次上櫃(各自內部已經平行處理四率+損益表)，跟股票數量無關，
     // 不管 Watchlist 有幾支股票在排隊等回補，總請求量都是固定的。
-    const int maxRetriesPerQuarter = 2;
+    // 重試次數壓到只有 1 次(共 2 次嘗試)：實測某些季別會整整卡滿逾時秒數才失敗(不是慢，是
+    // 完全沒回應)，重試次數越多、卡住的季別就越拖時間，2 次嘗試已經足夠應付偶發的暫時性問題，
+    // 不需要跟其餘資料的回補邏輯一樣重試到 3 次。
+    const int maxRetriesPerQuarter = 1;
     const int consecutiveEmptyQuartersToStop = 3;
 
     var (year, quarter) = PreviousQuarter(DateOnly.FromDateTime(DateTime.Today));
