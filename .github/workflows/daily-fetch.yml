@@ -26,6 +26,10 @@ on:
         description: '（月營收自動回補專用）任意非空值即進入自動掃描模式，由 Worker Cron Trigger 觸發，不建議手動使用'
         required: false
         default: ''
+      autoBackfillQuarterlyFinancials:
+        description: '（季報自動回補專用）任意非空值即進入自動掃描模式，由 Worker Cron Trigger 觸發，不建議手動使用'
+        required: false
+        default: ''
 
 # 同一時間只能有一個執行序在跑，避免排程跟手動觸發重疊時同時寫入 D1 造成資料競爭。
 # 新的執行會排隊等前一個跑完，不會取消它。
@@ -53,6 +57,8 @@ jobs:
         run: |
           if [ -n "${{ github.event.inputs.autoBackfillMonthlyRevenue }}" ]; then
             dotnet run -- --auto-backfill-monthly-revenue
+          elif [ -n "${{ github.event.inputs.autoBackfillQuarterlyFinancials }}" ]; then
+            dotnet run -- --auto-backfill-quarterly-financials
           elif [ -n "${{ github.event.inputs.monthlyRevenueBackfillStockCode }}" ]; then
             dotnet run -- --backfill-monthly-revenue "${{ github.event.inputs.monthlyRevenueBackfillStockCode }}" "${{ github.event.inputs.monthlyRevenueBackfillStartYearMonth }}"
           elif [ -n "${{ github.event.inputs.date }}" ] && [ -n "${{ github.event.inputs.stockCode }}" ]; then
